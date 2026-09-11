@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+use codex_model_provider_info::ModelDiscovery;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -170,6 +171,15 @@ fn model_provider_from_proto(
             )));
         }
     };
+    let model_discovery = match proto::ModelDiscovery::try_from(provider.model_discovery) {
+        Ok(proto::ModelDiscovery::Auto) => ModelDiscovery::Auto,
+        Ok(proto::ModelDiscovery::Disabled) => ModelDiscovery::Disabled,
+        Err(_) => {
+            return Err(parse_error(
+                "remote thread config returned unknown model_discovery",
+            ));
+        }
+    };
     let info = ModelProviderInfo {
         name: provider.name,
         base_url: provider.base_url,
@@ -182,6 +192,7 @@ fn model_provider_from_proto(
             .transpose()?,
         aws: None,
         wire_api,
+        model_discovery,
         query_params: provider.query_params.map(redacted_string_map),
         http_headers: provider.http_headers.map(redacted_string_map),
         env_http_headers: provider.env_http_headers.map(|map| map.values),
@@ -210,6 +221,7 @@ fn model_provider_to_proto(
         auth,
         aws: _,
         wire_api,
+        model_discovery,
         query_params,
         http_headers,
         env_http_headers,
@@ -231,6 +243,11 @@ fn model_provider_to_proto(
         experimental_bearer_token: experimental_bearer_token.map(RedactedString::into_inner),
         auth: auth.map(model_provider_auth_to_proto),
         wire_api: proto_wire_api(wire_api).into(),
+        model_discovery: match model_discovery {
+            ModelDiscovery::Auto => proto::ModelDiscovery::Auto,
+            ModelDiscovery::Disabled => proto::ModelDiscovery::Disabled,
+        }
+        .into(),
         query_params: query_params.map(proto_string_map),
         http_headers: http_headers.map(proto_string_map),
         env_http_headers: env_http_headers.map(|values| proto::StringMap { values }),
@@ -327,6 +344,7 @@ mod tests {
     use codex_protocol::config_types::ModelProviderAuthInfo;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use prost::Message;
     use tonic::Request;
     use tonic::Response;
     use tonic::Status;
@@ -460,6 +478,41 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn model_discovery_proto_preserves_disabled_and_legacy_auto() {
+        for mode in [ModelDiscovery::Auto, ModelDiscovery::Disabled] {
+            let provider = ModelProviderInfo {
+                model_discovery: mode,
+                ..expected_provider()
+            };
+            let proto = model_provider_to_proto("local", provider.clone());
+            let wire = proto.encode_to_vec();
+            let decoded =
+                proto::ModelProvider::decode(wire.as_slice()).expect("provider wire payload");
+            assert_eq!(decoded, proto);
+            assert_eq!(
+                model_provider_from_proto(decoded).expect("valid provider"),
+                ("local".to_string(), provider)
+            );
+        }
+        let mut legacy = model_provider_to_proto("local", expected_provider());
+        legacy.model_discovery = 0;
+        assert_eq!(
+            model_provider_from_proto(legacy)
+                .expect("legacy default")
+                .1
+                .model_discovery,
+            ModelDiscovery::Auto
+        );
+    }
+
+    #[test]
+    fn model_discovery_proto_rejects_unknown_mode() {
+        let mut proto = model_provider_to_proto("local", expected_provider());
+        proto.model_discovery = 99;
+        assert!(model_provider_from_proto(proto).is_err());
+    }
+
     fn proto_sources() -> Vec<proto::ThreadConfigSource> {
         let workspace_cwd = workspace_dir().to_string_lossy().into_owned();
         vec![
@@ -507,6 +560,7 @@ mod tests {
                             requires_openai_auth: false,
                             supports_websockets: true,
                             supports_standalone_web_search: true,
+                            model_discovery: proto::ModelDiscovery::Auto.into(),
                         }],
                         features: HashMap::from([
                             ("plugins".to_string(), false),
@@ -552,6 +606,7 @@ mod tests {
                 cwd: workspace_dir(),
             }),
             wire_api: WireApi::Responses,
+            model_discovery: ModelDiscovery::Auto,
             query_params: Some(HashMap::from([(
                 "api-version".to_string(),
                 "2026-04-16".into(),

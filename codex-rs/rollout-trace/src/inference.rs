@@ -396,10 +396,10 @@ mod tests {
     use codex_protocol::models::ReasoningItemReasoningSummary;
     use pretty_assertions::assert_eq;
     use serde_json::json;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::model::ExecutionStatus;
+    use crate::reducer::test_support::private_tempdir;
     use crate::replay_bundle;
 
     #[test]
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn enabled_attempt_adds_inference_request_header() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
+        let temp = private_tempdir()?;
         let writer = Arc::new(TraceWriter::create(
             temp.path(),
             "trace-1".to_string(),
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn enabled_context_records_replayable_inference_attempt() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
+        let temp = private_tempdir()?;
         let writer = Arc::new(TraceWriter::create(
             temp.path(),
             "trace-1".to_string(),

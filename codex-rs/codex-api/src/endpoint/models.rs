@@ -70,8 +70,10 @@ impl<T: HttpTransport> ModelsClient<T> {
         let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
             .map_err(|e| {
                 ApiError::Stream(format!(
-                    "failed to decode models response: {e}; body: {}",
-                    String::from_utf8_lossy(&resp.body)
+                    "failed to decode models response: {:?} at line {} column {}",
+                    e.classify(),
+                    e.line(),
+                    e.column()
                 ))
             })?;
 
@@ -97,17 +99,17 @@ mod tests {
     use std::time::Duration;
 
     #[derive(Clone)]
-    struct CapturingTransport {
-        last_request: Arc<Mutex<Option<Request>>>,
-        body: Arc<ModelsResponse>,
-        etag: Option<String>,
+    pub(super) struct CapturingTransport {
+        pub(super) last_request: Arc<Mutex<Option<Request>>>,
+        pub(super) body: Arc<Vec<u8>>,
+        pub(super) etag: Option<String>,
     }
 
     impl Default for CapturingTransport {
         fn default() -> Self {
             Self {
                 last_request: Arc::new(Mutex::new(None)),
-                body: Arc::new(ModelsResponse { models: Vec::new() }),
+                body: Arc::new(br#"{"models":[]}"#.to_vec()),
                 etag: None,
             }
         }
@@ -116,7 +118,7 @@ mod tests {
     impl HttpTransport for CapturingTransport {
         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
             *self.last_request.lock().unwrap() = Some(req);
-            let body = serde_json::to_vec(&*self.body).unwrap();
+            let body = (*self.body).clone();
             let mut headers = HeaderMap::new();
             if let Some(etag) = &self.etag {
                 headers.insert(ETAG, etag.parse().unwrap());
@@ -134,13 +136,13 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct DummyAuth;
+    pub(super) struct DummyAuth;
 
     impl AuthProvider for DummyAuth {
         fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
     }
 
-    fn provider(base_url: &str) -> Provider {
+    pub(super) fn provider(base_url: &str) -> Provider {
         Provider {
             name: "test".to_string(),
             base_url: base_url.to_string(),
@@ -163,7 +165,7 @@ mod tests {
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).expect("serialize rich catalog")),
             etag: None,
         };
 
@@ -200,6 +202,7 @@ mod tests {
                     "slug": "gpt-test",
                     "display_name": "gpt-test",
                     "description": "desc",
+                    "model_messages": {"instructions_template": "native instruction bytes\r\n{{literal}}\n"},
                     "default_reasoning_level": "medium",
                     "supported_reasoning_levels": [{"effort": "low", "description": "low"}, {"effort": "medium", "description": "medium"}, {"effort": "high", "description": "high"}],
                     "shell_type": "shell_command",
@@ -222,7 +225,7 @@ mod tests {
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).expect("serialize rich catalog")),
             etag: None,
         };
 
@@ -235,10 +238,7 @@ mod tests {
             .await
             .expect("request should succeed");
 
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].slug, "gpt-test");
-        assert_eq!(models[0].supported_in_api, true);
-        assert_eq!(models[0].priority, 1);
+        assert_eq!(models, response.models);
     }
 
     #[tokio::test]
@@ -247,7 +247,7 @@ mod tests {
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).expect("serialize rich catalog")),
             etag: Some("\"abc\"".to_string()),
         };
 
@@ -264,3 +264,7 @@ mod tests {
         assert_eq!(etag, Some("\"abc\"".to_string()));
     }
 }
+
+#[cfg(test)]
+#[path = "models_decode_tests.rs"]
+mod models_decode_tests;

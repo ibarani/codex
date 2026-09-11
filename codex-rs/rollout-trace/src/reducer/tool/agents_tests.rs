@@ -1,6 +1,5 @@
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tempfile::TempDir;
 
 use crate::model::AgentOrigin;
 use crate::model::ExecutionStatus;
@@ -17,6 +16,7 @@ use crate::reducer::test_support::append_completed_inference;
 use crate::reducer::test_support::append_inference_request;
 use crate::reducer::test_support::create_started_agent_writer;
 use crate::reducer::test_support::message;
+use crate::reducer::test_support::private_tempdir;
 use crate::reducer::test_support::start_agent_turn;
 use crate::reducer::test_support::start_thread;
 use crate::reducer::test_support::start_turn_for_thread;
@@ -27,7 +27,7 @@ use crate::writer::TraceWriter;
 
 #[test]
 fn child_thread_metadata_creates_spawn_origin_without_delivery_edge() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = TraceWriter::create(
         temp.path(),
         "trace-1".to_string(),
@@ -85,7 +85,7 @@ fn child_thread_metadata_creates_spawn_origin_without_delivery_edge() -> anyhow:
 
 #[test]
 fn spawn_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_agent_turn(&writer, "turn-1")?;
 
@@ -148,7 +148,7 @@ fn spawn_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()>
 
 #[test]
 fn spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_agent_turn(&writer, "turn-1")?;
     let spawn_payloads = append_spawn_agent_tool_lifecycle(&writer, "turn-1")?;
@@ -196,7 +196,7 @@ fn spawn_runtime_payload_falls_back_to_child_thread_without_delivery_item() -> a
 
 #[test]
 fn sub_agent_started_activity_creates_spawn_edge() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_agent_turn(&writer, "turn-1")?;
     let child_thread_id = "019d0000-0000-7000-8000-000000000002";
@@ -287,7 +287,7 @@ fn sub_agent_started_activity_creates_spawn_edge() -> anyhow::Result<()> {
 
 #[test]
 fn send_message_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_agent_turn(&writer, "turn-1")?;
     let invocation_payload = writer.write_json_payload(
@@ -393,7 +393,7 @@ fn send_message_runtime_payload_targets_delivered_child_message() -> anyhow::Res
 
 #[test]
 fn send_message_activity_targets_delivered_child_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_agent_turn(&writer, "turn-1")?;
     let child_thread_id = "019d0000-0000-7000-8000-000000000002";
@@ -479,7 +479,7 @@ fn send_message_activity_targets_delivered_child_message() -> anyhow::Result<()>
 
 #[test]
 fn followup_activity_targets_delivered_child_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_agent_turn(&writer, "turn-1")?;
     let child_thread_id = "019d0000-0000-7000-8000-000000000002";
@@ -565,7 +565,7 @@ fn followup_activity_targets_delivered_child_message() -> anyhow::Result<()> {
 
 #[test]
 fn close_agent_runtime_payload_targets_thread() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_thread(
         &writer,
@@ -688,7 +688,7 @@ fn close_agent_runtime_payload_targets_thread() -> anyhow::Result<()> {
 
 #[test]
 fn agent_result_edge_links_child_result_to_parent_notification() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
     start_thread(
         &writer,
@@ -775,7 +775,7 @@ fn agent_result_edge_links_child_result_to_parent_notification() -> anyhow::Resu
 
 #[test]
 fn agent_result_edge_falls_back_to_child_thread_without_result_message() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_agent_writer(&temp)?;
 
     // The child received its task but produced no assistant output. Failed

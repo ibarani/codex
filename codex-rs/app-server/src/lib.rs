@@ -1375,7 +1375,7 @@ fn test_user_config_file_from_env() -> Option<std::path::PathBuf> {
 }
 
 fn loader_overrides_with_test_user_config_file(
-    mut loader_overrides: LoaderOverrides,
+    loader_overrides: LoaderOverrides,
     test_user_config_file: Option<std::path::PathBuf>,
 ) -> IoResult<LoaderOverrides> {
     #[cfg(debug_assertions)]
@@ -1390,7 +1390,10 @@ fn loader_overrides_with_test_user_config_file(
             path = %path.as_path().display(),
             "using debug-only app-server test user config file"
         );
-        loader_overrides.user_config_path = Some(path);
+        return Ok(LoaderOverrides {
+            user_config_path: Some(path),
+            ..loader_overrides
+        });
     }
 
     #[cfg(not(debug_assertions))]

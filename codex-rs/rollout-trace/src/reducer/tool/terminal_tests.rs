@@ -1,6 +1,5 @@
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tempfile::TempDir;
 
 use crate::model::ExecutionStatus;
 use crate::model::ExecutionWindow;
@@ -18,6 +17,7 @@ use crate::raw_event::RawTraceEventPayload;
 use crate::reducer::test_support::create_started_writer;
 use crate::reducer::test_support::generic_summary;
 use crate::reducer::test_support::message;
+use crate::reducer::test_support::private_tempdir;
 use crate::reducer::test_support::start_turn;
 use crate::reducer::test_support::trace_context;
 use crate::replay_bundle;
@@ -25,7 +25,7 @@ use crate::writer::TraceWriter;
 
 #[test]
 fn exec_tool_reduces_to_terminal_operation_and_session() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
     append_inference_with_tool_call(&writer)?;
@@ -216,7 +216,7 @@ fn exec_tool_reduces_to_terminal_operation_and_session() -> anyhow::Result<()> {
 
 #[test]
 fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -319,7 +319,7 @@ fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()
 
 #[test]
 fn dispatch_write_stdin_payload_reduces_to_terminal_operation() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -440,7 +440,7 @@ fn dispatch_write_stdin_payload_reduces_to_terminal_operation() -> anyhow::Resul
 
 #[test]
 fn code_mode_write_stdin_result_projects_structured_exec_fields() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 

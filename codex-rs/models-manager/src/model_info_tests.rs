@@ -324,6 +324,53 @@ fn unknown_model_uses_builtin_instruction_template() {
 }
 
 #[test]
+fn unknown_model_context_override_preserves_native_instructions() {
+    for slug in ["kimi-k3", "another-unknown-provider-model"] {
+        for context_window in [128_000, 272_000, 1_048_576] {
+            let model = model_info_from_slug(slug);
+            let instructions = model.get_model_instructions(/*personality*/ None);
+            let config = ModelsManagerConfig {
+                model_context_window: Some(context_window),
+                ..Default::default()
+            };
+
+            let updated = with_config_overrides(model.clone(), &config);
+            let mut expected = model;
+            expected.context_window = Some(context_window);
+
+            assert_eq!(updated, expected, "context override for {slug}");
+            assert_eq!(updated.resolved_context_window(), Some(context_window));
+            assert_eq!(
+                updated
+                    .get_model_instructions(/*personality*/ None)
+                    .as_bytes(),
+                instructions.as_bytes(),
+            );
+            assert_eq!(instructions.as_bytes(), BASE_INSTRUCTIONS.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn unknown_model_without_override_keeps_conservative_context_estimate() {
+    for slug in ["kimi-k3", "another-unknown-provider-model"] {
+        let model = model_info_from_slug(slug);
+        let updated = with_config_overrides(model.clone(), &ModelsManagerConfig::default());
+
+        assert_eq!(updated, model);
+        assert_eq!(updated.context_window, Some(272_000));
+        assert_eq!(updated.max_context_window, None);
+        assert_eq!(updated.resolved_context_window(), Some(272_000));
+        assert_eq!(
+            updated
+                .get_model_instructions(/*personality*/ None)
+                .as_bytes(),
+            BASE_INSTRUCTIONS.as_bytes(),
+        );
+    }
+}
+
+#[test]
 fn model_context_window_override_clamps_to_max_context_window() {
     let mut model = model_info_from_slug("unknown-model");
     model.context_window = Some(273_000);

@@ -10,7 +10,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use tempfile::TempDir;
 
 use super::*;
 use crate::AgentResultTracePayload;
@@ -18,11 +17,12 @@ use crate::CompactionCheckpointTracePayload;
 use crate::ExecutionStatus;
 use crate::RawTraceEventPayload;
 use crate::RolloutStatus;
+use crate::reducer::test_support::private_tempdir;
 use crate::replay_bundle;
 
 #[test]
 fn create_in_root_writes_replayable_lifecycle_events() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let thread_id = ThreadId::new();
     let thread_trace = ThreadTraceContext::start_root_in_root_for_test(
         temp.path(),
@@ -57,7 +57,7 @@ fn create_in_root_writes_replayable_lifecycle_events() -> anyhow::Result<()> {
 
 #[test]
 fn spawned_thread_start_appends_to_root_bundle() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let root_thread_id = ThreadId::new();
     let child_thread_id = ThreadId::new();
     let root_trace = ThreadTraceContext::start_root_in_root_for_test(
@@ -111,7 +111,7 @@ fn spawned_thread_start_appends_to_root_bundle() -> anyhow::Result<()> {
 
 #[test]
 fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let thread_trace = ThreadTraceContext::disabled();
 
     thread_trace.record_ended(RolloutStatus::Completed);
@@ -167,7 +167,7 @@ fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Resu
 
 #[test]
 fn compaction_contexts_share_identity_across_models() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let thread_id = ThreadId::new();
     let thread_trace =
         ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(thread_id))?;
@@ -202,7 +202,7 @@ fn compaction_contexts_share_identity_across_models() -> anyhow::Result<()> {
 
 #[test]
 fn protocol_wrapper_records_selected_events_as_raw_payloads() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let thread_id = ThreadId::new();
     let thread_trace =
         ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(thread_id))?;

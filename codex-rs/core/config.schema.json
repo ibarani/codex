@@ -2140,6 +2140,25 @@
       },
       "type": "object"
     },
+    "ModelDiscovery": {
+      "description": "Policy for optional remote model metadata and its cache.",
+      "oneOf": [
+        {
+          "description": "Preserve automatic discovery for supported authentication modes.",
+          "enum": [
+            "auto"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use bundled metadata and explicit model settings without remote discovery or cache access.",
+          "enum": [
+            "disabled"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ModelProviderAuthInfo": {
       "additionalProperties": false,
       "description": "Configuration for obtaining a provider bearer token from a command.",
@@ -2256,6 +2275,15 @@
           },
           "description": "Additional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and value.",
           "type": "object"
+        },
+        "model_discovery": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelDiscovery"
+            }
+          ],
+          "default": "auto",
+          "description": "Whether to acquire optional remote model metadata or consult its cache."
         },
         "name": {
           "default": "",

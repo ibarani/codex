@@ -9,13 +9,17 @@
 mod bundle;
 mod code_cell;
 mod compaction;
+mod evidence;
 mod inference;
+mod limits;
 mod mcp;
 mod model;
 mod payload;
 mod protocol_event;
+mod publication;
 mod raw_event;
 mod reducer;
+mod storage;
 mod thread;
 mod tool_dispatch;
 mod writer;
@@ -30,6 +34,8 @@ pub use compaction::CompactionCheckpointTracePayload;
 pub use compaction::CompactionTraceAttempt;
 /// Shared recorder context for a compaction checkpoint.
 pub use compaction::CompactionTraceContext;
+/// Write a bounded private evidence stream from one admitted trace snapshot.
+pub use evidence::write_evidence;
 /// No-op-capable handle for recording one upstream inference attempt.
 pub use inference::InferenceTraceAttempt;
 /// Shared recorder context for inference attempts within one Codex turn.
@@ -44,6 +50,8 @@ pub use payload::RawPayloadId;
 pub use payload::RawPayloadKind;
 /// Reference to a raw request/response/log payload stored in the bundle.
 pub use payload::RawPayloadRef;
+/// Privately publish a complete reduced graph without replacing source evidence.
+pub use publication::reduce_to_file;
 /// Monotonic sequence number assigned by the raw trace writer.
 pub use raw_event::RawEventSeq;
 /// Runtime requester observed before semantic reduction.
@@ -54,7 +62,11 @@ pub use raw_event::RawTraceEvent;
 pub use raw_event::RawTraceEventContext;
 /// Typed payload for one raw trace event.
 pub use raw_event::RawTraceEventPayload;
-/// Replay a raw trace bundle and write/read its reduced `RolloutTrace`.
+/// Reduced graph together with the admitted original capture evidence.
+pub use reducer::AdmittedTraceBundle;
+/// Admit bounded local evidence and replay its existing semantic projection.
+pub use reducer::admit_bundle;
+/// Replay a bounded raw trace bundle into its diagnostic `RolloutTrace`.
 pub use reducer::replay_bundle;
 /// Raw payload captured when a child agent reports completion to its parent.
 pub use thread::AgentResultTracePayload;

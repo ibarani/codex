@@ -77,6 +77,8 @@ pub struct ModelProvider {
     pub supports_websockets: bool,
     #[prost(bool, tag = "18")]
     pub supports_standalone_web_search: bool,
+    #[prost(enumeration = "ModelDiscovery", tag = "19")]
+    pub model_discovery: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StringMap {
@@ -119,6 +121,32 @@ impl WireApi {
         match value {
             "WIRE_API_UNSPECIFIED" => Some(Self::Unspecified),
             "WIRE_API_RESPONSES" => Some(Self::Responses),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ModelDiscovery {
+    Auto = 0,
+    Disabled = 1,
+}
+impl ModelDiscovery {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Auto => "MODEL_DISCOVERY_AUTO",
+            Self::Disabled => "MODEL_DISCOVERY_DISABLED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MODEL_DISCOVERY_AUTO" => Some(Self::Auto),
+            "MODEL_DISCOVERY_DISABLED" => Some(Self::Disabled),
             _ => None,
         }
     }

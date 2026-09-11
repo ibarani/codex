@@ -151,7 +151,7 @@ bazel-lock-check:
 
 [windows]
 bazel-lock-check:
-    bazel mod deps --lockfile_mode=error; if ($LASTEXITCODE -ne 0) { Write-Error "MODULE.bazel.lock is out of date. Run 'just bazel-lock-update' and commit the updated lockfile."; exit 1 }
+    bazel mod deps --lockfile_mode=error --check_direct_dependencies=error; if ($LASTEXITCODE -ne 0) { Write-Error "Bazel dependency or lockfile validation failed. Resolve the reported dependency errors; run 'just bazel-lock-update' if the lockfile needs refreshing."; exit 1 }
 
 bazel-test:
     bazel test --test_tag_filters=-argument-comment-lint //... --keep_going

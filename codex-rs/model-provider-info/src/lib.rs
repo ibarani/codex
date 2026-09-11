@@ -91,6 +91,17 @@ impl<'de> Deserialize<'de> for WireApi {
     }
 }
 
+/// Policy for optional remote model metadata and its cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDiscovery {
+    /// Preserve automatic discovery for supported authentication modes.
+    #[default]
+    Auto,
+    /// Use bundled metadata and explicit model settings without remote discovery or cache access.
+    Disabled,
+}
+
 /// Serializable representation of a provider definition.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -117,6 +128,9 @@ pub struct ModelProviderInfo {
     /// Which wire protocol this provider expects.
     #[serde(default)]
     pub wire_api: WireApi,
+    /// Whether to acquire optional remote model metadata or consult its cache.
+    #[serde(default)]
+    pub model_discovery: ModelDiscovery,
     /// Optional query parameters to append to the base URL.
     pub query_params: Option<HashMap<String, RedactedString>>,
     /// Additional HTTP headers to include in requests to this provider where
@@ -393,6 +407,7 @@ impl ModelProviderInfo {
             auth: None,
             aws: None,
             wire_api: WireApi::Responses,
+            model_discovery: ModelDiscovery::Auto,
             query_params: None,
             http_headers: Some(
                 [("version".to_string(), env!("CARGO_PKG_VERSION").into())]
@@ -440,6 +455,7 @@ impl ModelProviderInfo {
                 auth_refresh: None,
             })),
             wire_api: WireApi::Responses,
+            model_discovery: ModelDiscovery::Auto,
             query_params: None,
             http_headers: Some(HashMap::from([(
                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
@@ -619,6 +635,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         auth: None,
         aws: None,
         wire_api,
+        model_discovery: ModelDiscovery::Auto,
         query_params: None,
         http_headers: None,
         env_http_headers: None,

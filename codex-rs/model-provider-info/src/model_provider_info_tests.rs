@@ -20,6 +20,7 @@ base_url = "http://localhost:11434/v1"
         auth: None,
         aws: None,
         wire_api: WireApi::Responses,
+        model_discovery: Default::default(),
         query_params: None,
         http_headers: None,
         env_http_headers: None,
@@ -53,6 +54,7 @@ query_params = { api-version = "2025-04-01-preview" }
         auth: None,
         aws: None,
         wire_api: WireApi::Responses,
+        model_discovery: Default::default(),
         query_params: Some(maplit::hashmap! {
             "api-version".to_string() => "2025-04-01-preview".into(),
         }),
@@ -90,6 +92,7 @@ supports_standalone_web_search = true
         auth: None,
         aws: None,
         wire_api: WireApi::Responses,
+        model_discovery: Default::default(),
         query_params: None,
         http_headers: Some(maplit::hashmap! {
             "X-Example-Header".to_string() => "example-value".into(),
@@ -268,6 +271,7 @@ fn test_create_amazon_bedrock_provider() {
                 auth_refresh: None,
             }),
             wire_api: WireApi::Responses,
+            model_discovery: Default::default(),
             query_params: None,
             http_headers: Some(maplit::hashmap! {
                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>
@@ -663,4 +667,29 @@ refresh_interval_ms = 0
     let auth = provider.auth.expect("auth config should deserialize");
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
+}
+
+#[test]
+fn model_discovery_toml_defaults_and_explicit_values_preserve_provider_fields() {
+    let base = "name = \"Moonshot\"\nbase_url = \"https://api.moonshot.ai/v1\"\n";
+    let expected: ModelProviderInfo = toml::from_str(base).expect("base provider");
+    assert_eq!(expected.model_discovery, ModelDiscovery::Auto);
+    for (value, mode) in [
+        ("auto", ModelDiscovery::Auto),
+        ("disabled", ModelDiscovery::Disabled),
+    ] {
+        let text = format!("{base}model_discovery = \"{value}\"\n");
+        let actual: ModelProviderInfo = toml::from_str(&text).expect("declared discovery mode");
+        assert_eq!(
+            actual,
+            ModelProviderInfo {
+                model_discovery: mode,
+                ..expected.clone()
+            }
+        );
+    }
+    for invalid in ["\"off\"", "false", "1", "[]"] {
+        let text = format!("{base}model_discovery = {invalid}\n");
+        assert!(toml::from_str::<ModelProviderInfo>(&text).is_err());
+    }
 }

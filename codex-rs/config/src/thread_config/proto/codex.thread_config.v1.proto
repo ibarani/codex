@@ -49,6 +49,7 @@ message ModelProvider {
   bool requires_openai_auth = 16;
   bool supports_websockets = 17;
   bool supports_standalone_web_search = 18;
+  ModelDiscovery model_discovery = 19;
 }
 
 message StringMap {
@@ -66,4 +67,9 @@ message ModelProviderAuthInfo {
 enum WireApi {
   WIRE_API_UNSPECIFIED = 0;
   WIRE_API_RESPONSES = 1;
+}
+
+enum ModelDiscovery {
+  MODEL_DISCOVERY_AUTO = 0;
+  MODEL_DISCOVERY_DISABLED = 1;
 }
