@@ -1221,9 +1221,17 @@ fn make_directory_tree_writable(path: &Path) -> std::io::Result<()> {
 
 fn remove_synthetic_mount_target(target: &crate::bwrap::SyntheticMountTarget) {
     let path = target.path();
+    // A non-directory ancestor also means the synthetic descendant no longer exists.
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return;
+        }
         Err(err) => panic!(
             "failed to inspect synthetic bubblewrap mount target {}: {err}",
             path.display()
@@ -1235,7 +1243,11 @@ fn remove_synthetic_mount_target(target: &crate::bwrap::SyntheticMountTarget) {
     match target.kind() {
         crate::bwrap::SyntheticMountTargetKind::EmptyFile => match fs::remove_file(path) {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
             Err(err) => panic!(
                 "failed to remove synthetic bubblewrap mount target {}: {err}",
                 path.display()
@@ -1243,7 +1255,11 @@ fn remove_synthetic_mount_target(target: &crate::bwrap::SyntheticMountTarget) {
         },
         crate::bwrap::SyntheticMountTargetKind::EmptyDirectory => match fs::remove_dir(path) {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
             Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
             Err(err) => panic!(
                 "failed to remove synthetic bubblewrap mount target {}: {err}",

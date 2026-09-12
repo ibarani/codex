@@ -316,6 +316,78 @@ async fn bwrap_populates_minimal_dev_nodes() {
 }
 
 #[tokio::test]
+async fn bwrap_writable_file_grant_preserves_read_only_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    let workspace = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(/*mode*/ 0o700))
+        .tempdir()
+        .expect("private file-grant fixture");
+    let allowed = workspace.path().join("allowed");
+    let sibling = workspace.path().join("sibling");
+    let missing = workspace.path().join("new-file");
+    std::fs::write(&allowed, "before").expect("write allowed file");
+    std::fs::write(&sibling, "unchanged").expect("write sibling file");
+    let file_system = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        },
+        FileSystemSandboxEntry {
+            path: AbsolutePathBuf::try_from(allowed.as_path())
+                .expect("absolute allowed file")
+                .into(),
+            access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
+        },
+    ]);
+    let output = run_cmd_result_with_permission_profile_for_cwd(
+        &[
+            "/bin/sh",
+            "-c",
+            r#"set -eu
+printf after > "$1"
+if (printf changed > "$2") 2>/dev/null; then exit 41; fi
+if (printf created > "$3") 2>/dev/null; then exit 42; fi
+printf file-only"#,
+            "file-grant-fixture",
+            allowed.to_str().expect("UTF-8 fixture path"),
+            sibling.to_str().expect("UTF-8 fixture path"),
+            missing.to_str().expect("UTF-8 fixture path"),
+        ],
+        AbsolutePathBuf::try_from(workspace.path()).expect("absolute fixture cwd"),
+        PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted),
+        create_env_from_core_vars(),
+        SHORT_TIMEOUT_MS,
+        /*use_legacy_landlock*/ false,
+    )
+    .await
+    .expect("sandboxed file grant should execute");
+
+    assert_eq!(
+        (output.exit_code, output.stdout.text, output.stderr.text),
+        (0, "file-only".to_string(), String::new()),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&allowed).expect("read allowed file"),
+        "after"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sibling).expect("read sibling file"),
+        "unchanged"
+    );
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
 async fn bwrap_preserves_writable_dev_shm_bind_mount() {
     if should_skip_bwrap_tests().await {
         eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");

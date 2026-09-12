@@ -51,7 +51,14 @@ commands that would enter the bubblewrap path.
   to both its namespace init and the command before execution. The same policy
   generator serves the in-process legacy path; filters are not duplicated.
 - When bubblewrap is active, the filesystem is read-only by default via `--ro-bind / /`.
-- When bubblewrap is active, writable roots are layered with `--bind <root> <root>`.
+- When bubblewrap is active, writable directory roots are layered with `--bind <root> <root>`.
+  A non-directory writable root is opened with `O_PATH`, classified through that descriptor,
+  and mounted with `--bind-fd`; it receives no directory-only metadata masks.
+  Bubblewrap verifies that the actual mount matches the pinned inode before starting the command.
+  On older system Bubblewrap, the existing trusted inner stage performs that identity check and
+  closes the inherited descriptor. Unknown metadata errors abort construction; a pathname-only
+  type check is insufficient for omitting directory protection.
+  This does not introduce a general guarantee about concurrent replacement of directory roots.
 - When bubblewrap is active, protected subpaths under writable roots (for
   example `.git`,
   resolved `gitdir:`, and `.codex`) are re-applied as read-only via `--ro-bind`.

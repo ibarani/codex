@@ -16,10 +16,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::fs::Metadata;
+use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -578,36 +580,58 @@ fn create_filesystem_args(
         }
 
         let mount_root = symlink_target.as_deref().unwrap_or(root);
-        bwrap_args.args.push("--bind".to_string());
-        bwrap_args.args.push(path_to_string(mount_root));
+        // O_PATH pins the classified object without opening devices or waiting on FIFOs.
+        let mount_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(mount_root)?;
+        let is_directory = mount_file.metadata()?.is_dir();
+        if is_directory {
+            bwrap_args.args.push("--bind".to_string());
+            bwrap_args.args.push(path_to_string(mount_root));
+            drop(mount_file);
+        } else {
+            // Omitting directory masks is safe only if the mounted object is this
+            // non-directory inode. Bubblewrap (or the legacy inner verifier)
+            // authenticates the descriptor against the resulting mount before exec.
+            bwrap_args.args.push("--bind-fd".to_string());
+            bwrap_args.args.push(mount_file.as_raw_fd().to_string());
+            bwrap_args.preserved_files.push(mount_file);
+        }
         bwrap_args.args.push(path_to_string(mount_root));
 
-        let mut read_only_subpaths: Vec<PathBuf> = writable_root
-            .read_only_subpaths
-            .iter()
-            .map(|path| path.as_path().to_path_buf())
-            .filter(|path| !unreadable_paths.contains(path))
-            .filter(|path| !missing_auto_metadata_read_only_project_root_subpaths.contains(path))
-            .collect();
-        let protected_metadata_names = writable_root.protected_metadata_names.clone();
-        append_metadata_path_masks_for_writable_root(
-            &mut read_only_subpaths,
-            root,
-            &protected_metadata_names,
-        );
-        if let Some(target) = &symlink_target {
-            read_only_subpaths = remap_paths_for_symlink_target(read_only_subpaths, root, target);
-        }
-        append_protected_create_targets_for_writable_root(
-            &mut bwrap_args,
-            &protected_metadata_names,
-            root,
-            symlink_target.as_deref(),
-            &read_only_subpaths,
-        );
-        read_only_subpaths.sort_by_key(|path| path_depth(path));
-        for subpath in read_only_subpaths {
-            append_read_only_subpath_args(&mut bwrap_args, &subpath, &allowed_write_paths)?;
+        // Only directory binds have descendant metadata paths and child carveouts.
+        if is_directory {
+            let mut read_only_subpaths: Vec<PathBuf> = writable_root
+                .read_only_subpaths
+                .iter()
+                .map(|path| path.as_path().to_path_buf())
+                .filter(|path| !unreadable_paths.contains(path))
+                .filter(|path| {
+                    !missing_auto_metadata_read_only_project_root_subpaths.contains(path)
+                })
+                .collect();
+            let protected_metadata_names = writable_root.protected_metadata_names.clone();
+            append_metadata_path_masks_for_writable_root(
+                &mut read_only_subpaths,
+                root,
+                &protected_metadata_names,
+            );
+            if let Some(target) = &symlink_target {
+                read_only_subpaths =
+                    remap_paths_for_symlink_target(read_only_subpaths, root, target);
+            }
+            append_protected_create_targets_for_writable_root(
+                &mut bwrap_args,
+                &protected_metadata_names,
+                root,
+                symlink_target.as_deref(),
+                &read_only_subpaths,
+            );
+            read_only_subpaths.sort_by_key(|path| path_depth(path));
+            for subpath in read_only_subpaths {
+                append_read_only_subpath_args(&mut bwrap_args, &subpath, &allowed_write_paths)?;
+            }
         }
         // Protect the registry only where a writable bind exposes it. Apply
         // this before deny masks so a denied parent stays hidden, rather than
@@ -1073,10 +1097,11 @@ fn append_read_only_subpath_args(
 }
 
 fn append_empty_file_bind_data_args(bwrap_args: &mut BwrapArgs, path: &Path) -> Result<()> {
-    if bwrap_args.preserved_files.is_empty() {
-        bwrap_args.preserved_files.push(File::open("/dev/null")?);
-    }
-    let null_fd = bwrap_args.preserved_files[0].as_raw_fd().to_string();
+    // Preserved descriptors may also hold writable file roots. Each data mask
+    // owns its empty source instead of assuming a particular vector position.
+    let null_file = File::open("/dev/null")?;
+    let null_fd = null_file.as_raw_fd().to_string();
+    bwrap_args.preserved_files.push(null_file);
     bwrap_args.args.push("--ro-bind-data".to_string());
     bwrap_args.args.push(null_fd);
     bwrap_args.args.push(path_to_string(path));
@@ -1910,6 +1935,156 @@ mod tests {
     }
 
     #[test]
+    fn writable_file_roots_do_not_receive_directory_carveouts() {
+        for symlinked in [false, true] {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let file = temp_dir.path().join("allowed-file");
+            std::fs::write(&file, "original").expect("write allowed file");
+            let root = if symlinked {
+                let link = temp_dir.path().join("file-link");
+                std::os::unix::fs::symlink(&file, &link).expect("link allowed file");
+                link
+            } else {
+                file.clone()
+            };
+            let policy = FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
+                },
+                FileSystemSandboxEntry {
+                    path: AbsolutePathBuf::try_from(root.as_path())
+                        .expect("absolute file root")
+                        .into(),
+                    access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
+                },
+            ]);
+            let args =
+                create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                    .expect("filesystem args");
+            let file = std::fs::canonicalize(&file).expect("canonical file root");
+            let file_text = path_to_string(&file);
+            let mount = args
+                .args
+                .windows(3)
+                .find(|window| window[0] == "--bind-fd" && window[2] == file_text)
+                .expect("file root must use an authenticated descriptor bind");
+            let source = args
+                .preserved_files
+                .iter()
+                .find(|file| file.as_raw_fd().to_string() == mount[1])
+                .expect("file descriptor remains owned through bubblewrap setup");
+            assert_eq!(
+                FileIdentity::from_metadata(&source.metadata().expect("descriptor metadata")),
+                FileIdentity::from_metadata(&fs::metadata(&file).expect("file metadata")),
+            );
+            assert!(args.synthetic_mount_targets.is_empty());
+            assert!(args.protected_create_targets.is_empty());
+            assert!(args.args.iter().all(|arg| {
+                let path = Path::new(arg);
+                path == file.as_path() || !path.starts_with(&file)
+            }));
+            assert_eq!(
+                std::fs::read_to_string(&file).expect("read file"),
+                "original"
+            );
+        }
+    }
+
+    #[test]
+    fn file_descriptors_do_not_replace_empty_mask_sources() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file = temp_dir.path().join("file");
+        let directory = temp_dir.path().join("directory");
+        fs::write(&file, "file contents").expect("write file");
+        fs::create_dir(&directory).expect("create directory");
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
+            },
+            FileSystemSandboxEntry {
+                path: AbsolutePathBuf::try_from(file.as_path())
+                    .expect("absolute file")
+                    .into(),
+                access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
+            },
+            FileSystemSandboxEntry {
+                path: AbsolutePathBuf::try_from(directory.as_path())
+                    .expect("absolute directory")
+                    .into(),
+                access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
+            },
+        ]);
+        let mut args =
+            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                .expect("filesystem args");
+        let directory_text = path_to_string(&directory);
+        assert!(args.args.windows(3).any(|window| {
+            window == ["--bind", directory_text.as_str(), directory_text.as_str()]
+        }));
+        for name in [".git", ".agents", ".codex"] {
+            assert_empty_directory_mounted_read_only(&args.args, &directory.join(name));
+        }
+
+        let masks = [
+            directory.join("missing-first"),
+            directory.join("missing-second"),
+        ];
+        for mask in &masks {
+            append_empty_file_bind_data_args(&mut args, mask).expect("append empty data mask");
+        }
+        let data_descriptors = masks.map(|mask| {
+            let mount = args
+                .args
+                .windows(3)
+                .find(|window| window[0] == "--ro-bind-data" && window[2] == path_to_string(&mask))
+                .expect("data mask must have its own source");
+            let source = args
+                .preserved_files
+                .iter()
+                .find(|file| file.as_raw_fd().to_string() == mount[1])
+                .expect("data source stays owned");
+            assert_eq!(
+                FileIdentity::from_metadata(&source.metadata().expect("data source metadata")),
+                FileIdentity::from_metadata(
+                    &fs::metadata("/dev/null").expect("empty device metadata")
+                ),
+            );
+            source.as_raw_fd()
+        });
+        assert_ne!(data_descriptors[0], data_descriptors[1]);
+        // Bubblewrap consumes and closes each data descriptor. Consuming one
+        // mask source must leave the next source valid and independently owned.
+        let first = args
+            .preserved_files
+            .iter()
+            .position(|file| file.as_raw_fd() == data_descriptors[0])
+            .expect("first data source is owned");
+        drop(args.preserved_files.remove(first));
+        let second = args
+            .preserved_files
+            .iter()
+            .find(|file| file.as_raw_fd() == data_descriptors[1])
+            .expect("second data source remains owned");
+        assert_eq!(
+            FileIdentity::from_metadata(
+                &second.metadata().expect("second data source remains open")
+            ),
+            FileIdentity::from_metadata(&fs::metadata("/dev/null").expect("empty device metadata")),
+        );
+    }
+
+    #[test]
     fn ignores_missing_writable_roots() {
         let temp_dir = TempDir::new().expect("temp dir");
         let existing_root = temp_dir.path().join("existing");
@@ -2456,15 +2631,19 @@ mod tests {
         let allowed_bind_index = args
             .args
             .windows(3)
-            .position(|window| {
-                window
-                    == [
-                        "--bind",
-                        allowed_file_str.as_str(),
-                        allowed_file_str.as_str(),
-                    ]
-            })
-            .expect("allowed file should be rebound writable");
+            .position(|window| window[0] == "--bind-fd" && window[2] == allowed_file_str)
+            .expect("allowed file should be rebound writable through its descriptor");
+        let source = args
+            .preserved_files
+            .iter()
+            .find(|file| file.as_raw_fd().to_string() == args.args[allowed_bind_index + 1])
+            .expect("writable file descriptor should remain owned");
+        assert_eq!(
+            FileIdentity::from_metadata(&source.metadata().expect("descriptor metadata")),
+            FileIdentity::from_metadata(
+                &fs::metadata(allowed_file.as_path()).expect("allowed file metadata")
+            ),
+        );
 
         assert!(
             blocked_none_index < allowed_bind_index,

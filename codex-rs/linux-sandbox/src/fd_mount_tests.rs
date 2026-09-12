@@ -21,6 +21,30 @@ fn matching_mount_closes_inherited_descriptor() {
     );
 }
 
+/// A file mount authenticates the pinned O_PATH inode and closes it before command execution.
+#[test]
+fn matching_file_mount_closes_inherited_path_descriptor() {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = tempfile::NamedTempFile::new().expect("temporary file should be created");
+    let descriptor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(file.path())
+        .expect("path descriptor should open")
+        .into_raw_fd();
+    let marker = format!("{descriptor}:{}", file.path().display());
+
+    verify_fd_mounts(&[marker]).expect("matching file mount should verify");
+
+    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF),
+    );
+}
+
 /// A swapped destination fails closed without leaking the original descriptor.
 #[test]
 fn mismatched_mount_closes_inherited_descriptor() {
