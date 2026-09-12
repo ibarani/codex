@@ -2841,8 +2841,12 @@ async fn permission_request_hook_allows_exec_command_without_user_approval() -> 
 
     let server = start_mock_server().await;
     let call_id = "permissionrequest-exec-command";
-    let marker = std::env::temp_dir().join("permissionrequest-exec-command-marker");
-    let command = format!("rm -f {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir
+        .path()
+        .join("permissionrequest-exec-command-marker");
+    let marker_arg = shlex::try_quote(marker.to_str().context("marker path is not UTF-8")?)?;
+    let command = format!("rm -f {marker_arg}");
     let args = serde_json::json!({ "cmd": command });
     let responses = mount_sse_sequence(
         &server,
@@ -3134,8 +3138,12 @@ async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()> {
 
     let server = start_mock_server().await;
     let call_id = "permissionrequest-exec-command";
-    let marker = std::env::temp_dir().join("permissionrequest-exec-command-marker");
-    let command = format!("rm -f {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir
+        .path()
+        .join("permissionrequest-exec-command-marker");
+    let marker_arg = shlex::try_quote(marker.to_str().context("marker path is not UTF-8")?)?;
+    let command = format!("rm -f {marker_arg}");
     let justification = "remove the temporary marker";
     let args = serde_json::json!({
         "cmd": command,
@@ -3523,8 +3531,12 @@ async fn blocked_pre_tool_use_records_additional_context_for_exec_command() -> R
 
     let server = start_mock_server().await;
     let call_id = "pretooluse-exec-command-blocked-context";
-    let marker = std::env::temp_dir().join("pretooluse-exec-command-blocked-context-marker");
-    let command = format!("printf blocked > {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir
+        .path()
+        .join("pretooluse-exec-command-blocked-context-marker");
+    let marker_arg = shlex::try_quote(marker.to_str().context("marker path is not UTF-8")?)?;
+    let command = format!("printf blocked > {marker_arg}");
     let args = serde_json::json!({ "cmd": command });
     let responses = mount_sse_sequence(
         &server,
@@ -3555,10 +3567,6 @@ async fn blocked_pre_tool_use_records_additional_context_for_exec_command() -> R
         })
         .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
-
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover pre tool use marker")?;
-    }
 
     test.submit_turn_with_permission_profile(
         "run the blocked shell command with pre hook context",
@@ -4361,8 +4369,12 @@ async fn plugin_pre_tool_use_blocks_exec_command_before_execution() -> Result<()
 
     let server = start_mock_server().await;
     let call_id = "plugin-pretooluse-exec-command";
-    let marker = std::env::temp_dir().join("plugin-pretooluse-exec-command-marker");
-    let command = format!("printf blocked > {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir
+        .path()
+        .join("plugin-pretooluse-exec-command-marker");
+    let marker_arg = shlex::try_quote(marker.to_str().context("marker path is not UTF-8")?)?;
+    let command = format!("printf blocked > {marker_arg}");
     let args = serde_json::json!({ "cmd": command });
     let responses = mount_sse_sequence(
         &server,
@@ -4470,10 +4482,6 @@ print(json.dumps({{
         });
     let test = builder.build(&server).await?;
 
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover plugin pre tool use marker")?;
-    }
-
     test.submit_turn_with_policy(
         "run the shell command blocked by a plugin hook",
         codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
@@ -4512,8 +4520,10 @@ async fn pre_tool_use_blocks_shell_when_defined_in_config_toml() -> Result<()> {
 
     let server = start_mock_server().await;
     let call_id = "pretooluse-config-toml";
-    let marker = std::env::temp_dir().join("pretooluse-config-toml-marker");
-    let command = format!("printf blocked > {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir.path().join("pretooluse-config-toml-marker");
+    let marker_arg = shlex::try_quote(marker.to_str().context("marker path is not UTF-8")?)?;
+    let command = format!("printf blocked > {marker_arg}");
     let args = serde_json::json!({ "cmd": command });
     let responses = mount_sse_sequence(
         &server,
@@ -4550,10 +4560,6 @@ async fn pre_tool_use_blocks_shell_when_defined_in_config_toml() -> Result<()> {
         })
         .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
-
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover config.toml marker")?;
-    }
 
     test.submit_turn_with_permission_profile(
         "run the blocked shell command from config toml",
@@ -4697,8 +4703,10 @@ async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()> {
 
     let server = start_mock_server().await;
     let call_id = "pretooluse-exec-command";
-    let marker = std::env::temp_dir().join("pretooluse-exec-command-marker");
-    let command = format!("printf blocked > {}", marker.display());
+    let marker_dir = TempDir::new()?;
+    let marker = marker_dir.path().join("pretooluse-exec-command-marker");
+    let marker_arg = shlex::try_quote(marker.to_str().context("marker path is not UTF-8")?)?;
+    let command = format!("printf blocked > {marker_arg}");
     let args = serde_json::json!({ "cmd": command });
     let responses = mount_sse_sequence(
         &server,
@@ -4730,10 +4738,6 @@ async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()> {
             trust_discovered_hooks(config);
         });
     let test = builder.build(&server).await?;
-
-    if marker.exists() {
-        fs::remove_file(&marker).context("remove leftover exec marker")?;
-    }
 
     test.submit_turn("run the blocked exec command").await?;
 
