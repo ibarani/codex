@@ -9,6 +9,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use codex_protocol::protocol::PatchApplyBeginEvent;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
@@ -81,11 +82,38 @@ impl TraceReducer {
         kind: &ToolCallKind,
         runtime_payload: &RawPayloadRef,
     ) -> Result<Option<TerminalOperationId>> {
-        let Some(operation_kind) = terminal_operation_kind(kind) else {
+        let operation_kind = terminal_operation_kind(kind);
+        if operation_kind.is_none() && !matches!(kind, ToolCallKind::ApplyPatch) {
+            return Ok(None);
+        }
+        let payload = self.read_payload_json(runtime_payload)?;
+        if matches!(kind, ToolCallKind::ApplyPatch)
+            || matches!(kind, ToolCallKind::ExecCommand)
+                && (payload.get("auto_approved").is_some() || payload.get("changes").is_some())
+        {
+            // exec_command intercepts valid apply_patch invocations before it
+            // starts a process. The dispatch identity remains exec_command,
+            // but its typed runtime evidence describes a patch, not a terminal.
+            let patch: PatchApplyBeginEvent = serde_json::from_value(payload.clone())?;
+            let tool = self
+                .rollout
+                .tool_calls
+                .get(tool_call_id)
+                .context("patch runtime start referenced an unknown tool")?;
+            if payload.get("command").is_some()
+                || patch.call_id != tool_call_id
+                || (!patch.turn_id.is_empty()
+                    && tool.started_by_codex_turn_id.as_deref() != Some(patch.turn_id.as_str()))
+                || tool.raw_runtime_payload_ids.len() != 1
+            {
+                bail!("patch runtime start disagrees with its tool context");
+            }
+            return Ok(None);
+        }
+        let Some(operation_kind) = operation_kind else {
             return Ok(None);
         };
 
-        let payload = self.read_payload_json(runtime_payload)?;
         let payload: ExecCommandBeginPayload =
             serde_json::from_value(payload).with_context(|| {
                 format!(

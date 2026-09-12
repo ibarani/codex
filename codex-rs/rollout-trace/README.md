@@ -21,6 +21,13 @@ is dropped and failure when it unwinds from a panic. These dispatch outcomes
 do not invent a process exit code or prove that an underlying child stopped;
 terminal runtime events and process cleanup are separate evidence.
 
+An `exec_command` invocation can be intercepted as `apply_patch` before a
+process starts. Replay preserves that canonical tool identity and its patch
+runtime payloads without creating a terminal operation, session, or exit code.
+Patch runtime payloads must have valid protocol shapes, matching call/turn
+identities and consistent terminal status; malformed or mixed patch/exec
+observations fail replay.
+
 Closing a session requests termination of its remaining unified-exec processes
 concurrently. Each confirmation waits up to five seconds for an observed exit
 code and closed output, preserving trailing output. An acknowledgement alone
