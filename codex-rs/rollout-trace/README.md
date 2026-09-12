@@ -21,6 +21,13 @@ is dropped and failure when it unwinds from a panic. These dispatch outcomes
 do not invent a process exit code or prove that an underlying child stopped;
 terminal runtime events and process cleanup are separate evidence.
 
+Closing a session requests termination of its remaining unified-exec processes
+concurrently. Each confirmation waits up to five seconds for an observed exit
+code and closed output, preserving trailing output. An acknowledgement alone
+does not confirm termination. Unconfirmed cleanup emits a warning and attempts
+best-effort termination. Cancelling an interactive turn still preserves its
+background processes until they are explicitly terminated or the session closes.
+
 When provider-command authentication is selected, failed acquisition produces
 no inference attempt or provider request. Existing explicit static/environment
 token precedence is unchanged.

@@ -9,15 +9,6 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
-use codex_exec_server::ExecProcess;
-use codex_exec_server::ExecProcessEventReceiver;
-use codex_exec_server::ExecProcessFuture;
-use codex_exec_server::ProcessId;
-use codex_exec_server::ProcessSignal;
-use codex_exec_server::ReadResponse;
-use codex_exec_server::StartedExecProcess;
-use codex_exec_server::WriteResponse;
-use codex_exec_server::WriteStatus;
 use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -224,90 +215,48 @@ impl SpawnLifecycle for TestSpawnLifecycle {
     }
 }
 
-struct BlockingTerminateExecProcess {
-    process_id: ProcessId,
-    terminate_started: watch::Sender<bool>,
-    allow_terminate: Arc<Notify>,
-    wake_tx: watch::Sender<u64>,
-}
-
-impl BlockingTerminateExecProcess {
-    async fn read(&self) -> Result<ReadResponse, codex_exec_server::ExecServerError> {
-        Ok(ReadResponse {
-            chunks: Vec::new(),
-            next_seq: 1,
-            exited: false,
-            exit_code: None,
-            closed: false,
-            failure: None,
-            sandbox_denied: false,
-        })
-    }
-
-    async fn write(&self) -> Result<WriteResponse, codex_exec_server::ExecServerError> {
-        Ok(WriteResponse {
-            status: WriteStatus::Accepted,
-        })
-    }
-
-    async fn terminate(&self) -> Result<(), codex_exec_server::ExecServerError> {
-        let _ = self.terminate_started.send(true);
-        self.allow_terminate.notified().await;
-        Ok(())
-    }
-}
-
-impl ExecProcess for BlockingTerminateExecProcess {
-    fn process_id(&self) -> &ProcessId {
-        &self.process_id
-    }
-
-    fn subscribe_wake(&self) -> watch::Receiver<u64> {
-        self.wake_tx.subscribe()
-    }
-
-    fn subscribe_events(&self) -> ExecProcessEventReceiver {
-        ExecProcessEventReceiver::empty()
-    }
-
-    fn read(
-        &self,
-        _after_seq: Option<u64>,
-        _max_bytes: Option<usize>,
-        _wait_ms: Option<u64>,
-    ) -> ExecProcessFuture<'_, ReadResponse> {
-        Box::pin(BlockingTerminateExecProcess::read(self))
-    }
-
-    fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
-        Box::pin(BlockingTerminateExecProcess::write(self))
-    }
-
-    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn terminate(&self) -> ExecProcessFuture<'_, ()> {
-        Box::pin(BlockingTerminateExecProcess::terminate(self))
-    }
-}
-
+/// Keep the existing termination race controls while observing exit and output closure.
 async fn blocking_terminate_unified_process(
-    process_id: i32,
     terminate_started: watch::Sender<bool>,
     allow_terminate: Arc<Notify>,
 ) -> anyhow::Result<Arc<UnifiedExecProcess>> {
-    let (wake_tx, _wake_rx) = watch::channel(0);
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
+    let completion = tokio::spawn(async move {
+        if terminate_rx.await.is_ok() {
+            let allowed = allow_terminate.notified();
+            tokio::pin!(allowed);
+            allowed.as_mut().enable();
+            let _ = terminate_started.send(true);
+            allowed.await;
+            let _ = exit_tx.send(137);
+        }
+        drop(stdout_tx);
+    });
+    let mut terminate_tx = Some(terminate_tx);
+    let spawned = codex_utils_pty::spawn_from_driver(codex_utils_pty::ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(move || {
+            if let Some(terminate_tx) = terminate_tx.take() {
+                let _ = terminate_tx.send(());
+            }
+        })),
+        writer_handle: Some(completion),
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
     Ok(Arc::new(
-        UnifiedExecProcess::from_exec_server_started(StartedExecProcess {
-            process: Arc::new(BlockingTerminateExecProcess {
-                process_id: process_id.to_string().into(),
-                terminate_started,
-                allow_terminate,
-                wake_tx,
-            }),
-            sandbox_type: Some(codex_sandboxing::SandboxType::None),
-        })
+        UnifiedExecProcess::from_spawned(
+            spawned,
+            codex_sandboxing::SandboxType::None,
+            Box::new(super::process::NoopSpawnLifecycle),
+        )
         .await?,
     ))
 }
@@ -597,12 +546,9 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
     let process_id = manager.allocate_process_id().await;
     let (terminate_started_tx, mut terminate_started_rx) = watch::channel(false);
     let allow_terminate = Arc::new(Notify::new());
-    let process = blocking_terminate_unified_process(
-        process_id,
-        terminate_started_tx,
-        Arc::clone(&allow_terminate),
-    )
-    .await?;
+    let process =
+        blocking_terminate_unified_process(terminate_started_tx, Arc::clone(&allow_terminate))
+            .await?;
     #[allow(deprecated)]
     let cwd = turn.cwd.clone();
     manager.process_store.lock().await.processes.insert(
@@ -679,12 +625,9 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
     let process_id = manager.allocate_process_id().await;
     let (terminate_started_tx, _terminate_started_rx) = watch::channel(false);
     let allow_terminate = Arc::new(Notify::new());
-    let process = blocking_terminate_unified_process(
-        process_id,
-        terminate_started_tx,
-        Arc::clone(&allow_terminate),
-    )
-    .await?;
+    let process =
+        blocking_terminate_unified_process(terminate_started_tx, Arc::clone(&allow_terminate))
+            .await?;
     #[allow(deprecated)]
     let cwd = turn.cwd.clone();
     let last_used = Instant::now() - Duration::from_secs(1);
@@ -1005,18 +948,17 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
                     ("call", Some("write"), cwd.clone().into())
                 );
                 assert!(original.interaction_lock().try_lock_owned().is_err());
-                if input == "replace\n" {
-                    let replacement = super::process_tests::remote_process(
-                        WriteStatus::Accepted,
-                        /*terminate_error*/ None,
-                        SandboxType::None,
-                    )
-                    .await;
+                let replacement = if input == "replace\n" {
+                    let replacement = super::process_tests::controlled_process().await;
                     let mut store = manager.process_store.lock().await;
-                    store.processes.get_mut(&process_id).unwrap().process = Arc::new(replacement);
-                }
+                    store.processes.get_mut(&process_id).unwrap().process =
+                        Arc::clone(&replacement.process);
+                    Some(replacement)
+                } else {
+                    None
+                };
                 session.notify_approval("write", decision).await;
-                return anyhow::Ok(());
+                return anyhow::Ok(replacement);
             }
         };
         let (result, reviewed) = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
@@ -1028,7 +970,7 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
             )
         })
         .await?;
-        reviewed?;
+        let replacement = reviewed?;
         match input {
             "rejected\n" => assert!(matches!(result, Err(UnifiedExecError::StdinApproval(_)))),
             "accepted\n" => {
@@ -1041,8 +983,13 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
             ),
         }
         assert!(original.interaction_lock().try_lock_owned().is_ok());
+        if let Some(replacement) = replacement {
+            assert!(!replacement.process.has_exited());
+            replacement.exit.send(0).expect("replacement process exits");
+            drop(replacement.stdout);
+        }
     }
-    original.terminate();
+    original.terminate_confirmed().await?;
     assert!(session.terminate_background_terminal(process_id).await);
     Ok(())
 }
