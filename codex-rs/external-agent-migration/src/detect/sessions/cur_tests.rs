@@ -369,6 +369,243 @@ fn detects_cur_sessions_in_batches_and_redetects_modified_imports() {
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn detects_cur_transcript_with_multiple_punctuated_ancestors() {
+    let root = TempDir::new().expect("tempdir");
+    let project_root = root.path().join("outer-one/middle-two/my-project");
+    fs::create_dir_all(&project_root).expect("nested project");
+    let external_agent_home = root.path().join(".external");
+    let transcript = write_transcript(
+        &external_agent_home,
+        &encode_project_path(&project_root),
+        "nested-session",
+        "nested request",
+    );
+
+    assert_eq!(
+        detect_recent_cur_sessions(&external_agent_home, root.path()).expect("detect sessions"),
+        vec![ExternalAgentSessionMigration {
+            path: transcript,
+            cwd: project_root,
+            title: Some("nested request".to_string()),
+        }]
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn rejects_distinct_complete_paths_across_multiple_partitions() {
+    let root = TempDir::new().expect("tempdir");
+    fs::create_dir_all(root.path().join("a-b/c-d")).expect("first project");
+    fs::create_dir_all(root.path().join("a/b-c/d")).expect("second project");
+
+    assert_eq!(
+        resolve_cur_project_components(
+            root.path(),
+            &["a", "b", "c", "d"],
+            CUR_PROJECT_PATH_PROBES_PER_COMPONENT * 4,
+        ),
+        None
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn rejects_probe_exhaustion_even_after_finding_a_complete_path() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root.path().join("a-b");
+    fs::create_dir(&project).expect("project");
+    fs::create_dir_all(root.path().join("a/c")).expect("unmatched alternate partition");
+
+    // The first prefix generates one literal plus all two-part separators.
+    // After a-b matches, the alternate a/b still requires one native probe.
+    let root_probes = 1 + CUR_PROJECT_SEPARATORS.len();
+    for (probes, expected) in [(root_probes, None), (root_probes + 1, Some(project))] {
+        assert_eq!(
+            resolve_cur_project_components(root.path(), &["a", "b"], probes),
+            expected,
+            "probes={probes}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn follows_directory_symlinks_without_replacing_the_lexical_project_path() {
+    let root = TempDir::new().expect("tempdir");
+    let target = root.path().join("target/child");
+    fs::create_dir_all(&target).expect("target");
+    std::os::unix::fs::symlink(root.path().join("target"), root.path().join("linked"))
+        .expect("directory symlink");
+
+    assert_eq!(
+        resolve_cur_project_components(
+            root.path(),
+            &["linked", "child"],
+            CUR_PROJECT_PATH_PROBES_PER_COMPONENT * 2,
+        ),
+        Some(root.path().join("linked/child"))
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn confirms_ascii_case_matches_using_native_filesystem_lookup() {
+    let root = TempDir::new().expect("tempdir");
+    fs::create_dir(root.path().join("MiXeD-NaMe")).expect("mixed-case project");
+    for components in [["MiXeD", "NaMe"], ["mixed", "name"]] {
+        let candidate = root.path().join(components.join("-"));
+        let expected = candidate.is_dir().then_some(candidate);
+        assert_eq!(
+            resolve_cur_project_components(
+                root.path(),
+                &components,
+                components.len() * CUR_PROJECT_PATH_PROBES_PER_COMPONENT,
+            ),
+            expected
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn leaves_unicode_collation_and_normalization_to_native_lookup() {
+    for (directory, components) in [
+        ("e\u{301}cole-repo", ["école", "repo"]),
+        ("K-repo", ["K", "repo"]),
+    ] {
+        let root = TempDir::new().expect("tempdir");
+        fs::create_dir(root.path().join(directory)).expect("Unicode project");
+        let candidate = root.path().join(components.join("-"));
+        let expected = candidate.is_dir().then_some(candidate);
+        assert_eq!(
+            resolve_cur_project_components(
+                root.path(),
+                &components,
+                components.len() * CUR_PROJECT_PATH_PROBES_PER_COMPONENT,
+            ),
+            expected
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_native_probe_errors_even_after_finding_a_complete_path() {
+    let root = TempDir::new().expect("tempdir");
+    fs::create_dir(root.path().join("a-b")).expect("complete candidate");
+    fs::create_dir(root.path().join("a")).expect("alternate prefix");
+    let loop_path = root.path().join("a/b");
+    std::os::unix::fs::symlink("b", &loop_path).expect("owned symlink loop");
+    let error = fs::metadata(&loop_path).expect_err("loop must fail native lookup");
+    assert!(!matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    ));
+
+    // a-b is visited first, but the unresolved a/b alternative prevents uniqueness.
+    assert_eq!(
+        resolve_cur_project_components(
+            root.path(),
+            &["a", "b"],
+            CUR_PROJECT_PATH_PROBES_PER_COMPONENT * 2,
+        ),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ignores_absent_dangling_and_non_directory_candidates() {
+    for kind in ["absent", "file", "dangling", "not-a-directory"] {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join("a-b");
+        fs::create_dir(&project).expect("complete candidate");
+        let alternate = root.path().join("a");
+        match kind {
+            "absent" => {}
+            "file" => fs::write(&alternate, b"fixture").expect("non-directory candidate"),
+            "dangling" => {
+                std::os::unix::fs::symlink("missing", &alternate).expect("dangling candidate");
+                assert_eq!(
+                    fs::metadata(&alternate)
+                        .expect_err("dangling lookup")
+                        .kind(),
+                    io::ErrorKind::NotFound,
+                );
+            }
+            "not-a-directory" => {
+                fs::write(root.path().join("file"), b"fixture").expect("non-directory parent");
+                std::os::unix::fs::symlink("file/child", &alternate)
+                    .expect("non-directory candidate target");
+                assert_eq!(
+                    fs::metadata(&alternate)
+                        .expect_err("invalid parent lookup")
+                        .kind(),
+                    io::ErrorKind::NotADirectory,
+                );
+            }
+            _ => unreachable!("fixed fixture kinds"),
+        }
+        assert_eq!(
+            resolve_cur_project_components(
+                root.path(),
+                &["a", "b"],
+                CUR_PROJECT_PATH_PROBES_PER_COMPONENT * 2,
+            ),
+            Some(project),
+            "{kind} alternative must not hide the complete candidate"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unrelated_entries_do_not_consume_project_candidate_budget() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root.path().join("a-b");
+    fs::create_dir(&project).expect("project");
+    let probes = 1 + CUR_PROJECT_SEPARATORS.len();
+    assert_eq!(
+        resolve_cur_project_components(root.path(), &["a", "b"], probes),
+        Some(project.clone())
+    );
+    for index in 0..4097 {
+        fs::write(root.path().join(format!("unrelated-{index}")), b"fixture")
+            .expect("unrelated directory entry");
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        fs::write(root.path().join(OsString::from_vec(vec![0xff])), b"fixture")
+            .expect("unrelated non-UTF8 entry");
+    }
+    assert_eq!(
+        resolve_cur_project_components(root.path(), &["a", "b"], probes),
+        Some(project)
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn input_proportional_budget_resolves_many_literal_ancestors() {
+    let root = TempDir::new().expect("tempdir");
+    let components = ["one", "two", "three", "four", "five", "six"];
+    let project = root.path().join(components.join("/"));
+    fs::create_dir_all(&project).expect("deep project");
+    assert_eq!(
+        resolve_cur_project_components(
+            root.path(),
+            &components,
+            components.len() * CUR_PROJECT_PATH_PROBES_PER_COMPONENT,
+        ),
+        Some(project)
+    );
+}
+
 fn write_transcript(
     external_agent_home: &Path,
     encoded_project: &str,
