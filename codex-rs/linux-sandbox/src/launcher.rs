@@ -26,6 +26,7 @@ struct SystemBwrapLauncher {
     program: AbsolutePathBuf,
     supports_argv0: bool,
     supports_ro_bind_fd: bool,
+    supports_bind_fd: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,14 +34,13 @@ struct SystemBwrapCapabilities {
     supports_argv0: bool,
     supports_perms: bool,
     supports_ro_bind_fd: bool,
+    supports_bind_fd: bool,
 }
 
 pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> ! {
-    argv.insert(1, "--as-pid-1".to_string());
-
     match preferred_bwrap_launcher() {
         BubblewrapLauncher::System(launcher) => {
-            if !launcher.supports_ro_bind_fd {
+            if !launcher.supports_ro_bind_fd || !launcher.supports_bind_fd {
                 translate_legacy_bwrap_fd_mounts(&mut argv)
                     .unwrap_or_else(|error| panic!("invalid legacy bubblewrap fd mount: {error}"));
             }
@@ -66,41 +66,49 @@ fn translate_legacy_bwrap_fd_mounts(argv: &mut Vec<String>) -> Result<(), String
     let mut argument_index = 0;
 
     while argument_index < command_separator {
-        if argv[argument_index] != "--ro-bind-fd" {
-            argument_index += 1;
-            continue;
-        }
+        let bind_option = match argv[argument_index].as_str() {
+            "--ro-bind-fd" => "--ro-bind",
+            "--bind-fd" => "--bind",
+            _ => {
+                argument_index += 1;
+                continue;
+            }
+        };
 
         let fd_argument = argv
             .get(argument_index + 1)
             .filter(|_| argument_index + 1 < command_separator)
-            .ok_or_else(|| "--ro-bind-fd is missing its file descriptor".to_string())?;
-        let fd = fd_argument
-            .parse::<libc::c_int>()
-            .map_err(|_| format!("invalid --ro-bind-fd file descriptor: {fd_argument}"))?;
+            .ok_or_else(|| "descriptor-backed mount is missing its file descriptor".to_string())?;
+        let fd = fd_argument.parse::<libc::c_int>().map_err(|_| {
+            format!("invalid descriptor-backed mount file descriptor: {fd_argument}")
+        })?;
         if fd <= libc::STDERR_FILENO {
             return Err(format!(
-                "--ro-bind-fd file descriptor must not use standard descriptors: {fd}"
+                "descriptor-backed mount file descriptor must not use standard descriptors: {fd}"
             ));
         }
         if verified_fds.contains(&fd) {
-            return Err(format!("duplicate --ro-bind-fd file descriptor: {fd}"));
+            return Err(format!(
+                "duplicate descriptor-backed mount file descriptor: {fd}"
+            ));
         }
 
         let destination = argv
             .get(argument_index + 2)
             .filter(|_| argument_index + 2 < command_separator)
-            .ok_or_else(|| "--ro-bind-fd is missing its mount destination".to_string())?;
+            .ok_or_else(|| {
+                "descriptor-backed mount is missing its mount destination".to_string()
+            })?;
         if !Path::new(destination).is_absolute() {
             return Err(format!(
-                "--ro-bind-fd mount destination must be absolute: {destination}"
+                "descriptor-backed mount destination must be absolute: {destination}"
             ));
         }
 
         verification_args.push("--verify-fd-mount".to_string());
         verification_args.push(format!("{fd}:{destination}"));
         verified_fds.push(fd);
-        argv[argument_index] = "--ro-bind".to_string();
+        argv[argument_index] = bind_option.to_string();
         argv[argument_index + 1] = format!("/proc/self/fd/{fd}");
         argument_index += 3;
     }
@@ -157,6 +165,7 @@ fn system_bwrap_launcher_for_path_with_probe(
         supports_argv0,
         supports_perms: true,
         supports_ro_bind_fd,
+        supports_bind_fd,
     }) = system_bwrap_capabilities(system_bwrap_path)
     else {
         return None;
@@ -172,6 +181,7 @@ fn system_bwrap_launcher_for_path_with_probe(
         program: system_bwrap_path,
         supports_argv0,
         supports_ro_bind_fd,
+        supports_bind_fd,
     })
 }
 
@@ -194,13 +204,11 @@ fn system_bwrap_capabilities(system_bwrap_path: &Path) -> Option<SystemBwrapCapa
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stdout.contains("--as-pid-1") && !stderr.contains("--as-pid-1") {
-        return None;
-    }
     Some(SystemBwrapCapabilities {
         supports_argv0: stdout.contains("--argv0") || stderr.contains("--argv0"),
         supports_perms: stdout.contains("--perms") || stderr.contains("--perms"),
         supports_ro_bind_fd: stdout.contains("--ro-bind-fd") || stderr.contains("--ro-bind-fd"),
+        supports_bind_fd: stdout.contains("--bind-fd") || stderr.contains("--bind-fd"),
     })
 }
 
@@ -251,12 +259,14 @@ mod tests {
                     supports_argv0: true,
                     supports_perms: true,
                     supports_ro_bind_fd: true,
+                    supports_bind_fd: true,
                 })
             }),
             Some(SystemBwrapLauncher {
                 program: expected,
                 supports_argv0: true,
                 supports_ro_bind_fd: true,
+                supports_bind_fd: true,
             })
         );
     }
@@ -272,12 +282,14 @@ mod tests {
                     supports_argv0: false,
                     supports_perms: true,
                     supports_ro_bind_fd: false,
+                    supports_bind_fd: false,
                 })
             }),
             Some(SystemBwrapLauncher {
                 program: AbsolutePathBuf::from_absolute_path(fake_bwrap_path).expect("absolute"),
                 supports_argv0: false,
                 supports_ro_bind_fd: false,
+                supports_bind_fd: false,
             })
         );
     }
@@ -292,6 +304,7 @@ mod tests {
                     supports_argv0: false,
                     supports_perms: false,
                     supports_ro_bind_fd: false,
+                    supports_bind_fd: false,
                 })
             }),
             None
@@ -304,7 +317,7 @@ mod tests {
         let fake_bwrap_path = temp_dir.path().join("bwrap");
         std::fs::write(
             &fake_bwrap_path,
-            "#!/bin/sh\nprintf '%s\\n' '--as-pid-1' '--perms' '--argv0' '--ro-bind-fd'\n",
+            "#!/bin/sh\nprintf '%s\\n' '--as-pid-1' '--perms' '--argv0' '--ro-bind-fd' '--bind-fd'\n",
         )
         .expect("write fake bubblewrap");
         std::fs::set_permissions(&fake_bwrap_path, std::fs::Permissions::from_mode(0o755))
@@ -316,8 +329,44 @@ mod tests {
                 supports_argv0: true,
                 supports_perms: true,
                 supports_ro_bind_fd: true,
+                supports_bind_fd: true,
             })
         );
+    }
+
+    #[test]
+    fn detects_read_only_fd_support_without_assuming_writable_fd_support() {
+        let temp_dir = tempfile::tempdir().expect("temp directory");
+        let fake_bwrap_path = temp_dir.path().join("bwrap");
+        std::fs::write(
+            &fake_bwrap_path,
+            "#!/bin/sh\nprintf '%s\\n' '--perms' '--argv0' '--ro-bind-fd'\n",
+        )
+        .expect("write fake bubblewrap");
+        std::fs::set_permissions(&fake_bwrap_path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake bubblewrap executable");
+        assert_eq!(
+            system_bwrap_capabilities(&fake_bwrap_path),
+            Some(SystemBwrapCapabilities {
+                supports_argv0: true,
+                supports_perms: true,
+                supports_ro_bind_fd: true,
+                supports_bind_fd: false,
+            }),
+        );
+    }
+
+    #[test]
+    fn writable_fd_mount_requires_trusted_inner_verification() {
+        let mut argv = vec![
+            "bwrap".to_string(),
+            "--bind-fd".to_string(),
+            "7".to_string(),
+            "/tmp/allowed-file".to_string(),
+            "--".to_string(),
+            "/bin/true".to_string(),
+        ];
+        assert!(translate_legacy_bwrap_fd_mounts(&mut argv).is_err());
     }
 
     #[test]
@@ -363,7 +412,7 @@ mod tests {
             "--ro-bind-fd".to_string(),
             "7".to_string(),
             "/tmp/first".to_string(),
-            "--ro-bind-fd".to_string(),
+            "--bind-fd".to_string(),
             "9".to_string(),
             "/tmp/second:with-colon".to_string(),
             "--".to_string(),
@@ -382,7 +431,7 @@ mod tests {
                 "--ro-bind".to_string(),
                 "/proc/self/fd/7".to_string(),
                 "/tmp/first".to_string(),
-                "--ro-bind".to_string(),
+                "--bind".to_string(),
                 "/proc/self/fd/9".to_string(),
                 "/tmp/second:with-colon".to_string(),
                 "--".to_string(),
@@ -441,7 +490,7 @@ mod tests {
             "--ro-bind-fd".to_string(),
             "7".to_string(),
             "/tmp/first".to_string(),
-            "--ro-bind-fd".to_string(),
+            "--bind-fd".to_string(),
             "7".to_string(),
             "/tmp/second".to_string(),
             "--".to_string(),

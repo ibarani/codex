@@ -1773,6 +1773,28 @@ fn session_header_hides_fast_status_when_disabled() {
 }
 
 #[test]
+fn session_header_preserves_explicit_versions_and_border_alignment() {
+    for version in [
+        "0.0.0",
+        crate::version::CODEX_CLI_VERSION,
+        "123.456.789-rc.123",
+    ] {
+        let cell = SessionHeaderHistoryCell::new(
+            "gpt-4o".to_string(),
+            /*reasoning_effort*/ None,
+            /*show_fast_status*/ false,
+            PathBuf::from("project"),
+            version,
+        );
+        let lines = cell.display_lines(/*width*/ 80);
+        let rendered = render_lines(&lines);
+        assert!(rendered[1].contains(&format!("(v{version})")));
+        let border_width = line_width(&lines[0]);
+        assert!(lines.iter().all(|line| line_width(line) == border_width));
+    }
+}
+
+#[test]
 fn session_header_clamps_to_narrow_width() {
     const WIDTH: u16 = 44;
     let cell = SessionHeaderHistoryCell::new(

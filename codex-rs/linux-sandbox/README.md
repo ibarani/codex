@@ -46,10 +46,19 @@ commands that would enter the bubblewrap path.
 - Split-only filesystem policies that do not round-trip through the legacy
   `SandboxPolicy` model stay on bubblewrap so nested read-only or denied
   carveouts are preserved.
-- When bubblewrap is active, the helper applies `PR_SET_NO_NEW_PRIVS` and a
-  seccomp network filter in-process.
+- When network filtering is required with Bubblewrap, the helper passes its
+  network filter through a sealed anonymous descriptor. Bubblewrap applies `PR_SET_NO_NEW_PRIVS` and that filter
+  to both its namespace init and the command before execution. The same policy
+  generator serves the in-process legacy path; filters are not duplicated.
 - When bubblewrap is active, the filesystem is read-only by default via `--ro-bind / /`.
-- When bubblewrap is active, writable roots are layered with `--bind <root> <root>`.
+- When bubblewrap is active, writable directory roots are layered with `--bind <root> <root>`.
+  A non-directory writable root is opened with `O_PATH`, classified through that descriptor,
+  and mounted with `--bind-fd`; it receives no directory-only metadata masks.
+  Bubblewrap verifies that the actual mount matches the pinned inode before starting the command.
+  On older system Bubblewrap, the existing trusted inner stage performs that identity check and
+  closes the inherited descriptor. Unknown metadata errors abort construction; a pathname-only
+  type check is insufficient for omitting directory protection.
+  This does not introduce a general guarantee about concurrent replacement of directory roots.
 - When bubblewrap is active, protected subpaths under writable roots (for
   example `.git`,
   resolved `gitdir:`, and `.codex`) are re-applied as read-only via `--ro-bind`.
@@ -81,6 +90,14 @@ commands that would enter the bubblewrap path.
 - When bubblewrap is active, symlink-in-path and non-existent protected paths inside
   writable roots are blocked by mounting `/dev/null` on the symlink or first
   missing component.
+- Bubblewrap retains its own namespace init to reap children and terminate the
+  namespace when its outer monitor exits. The trusted inner Codex stage verifies
+  inherited mounts and capabilities and finishes proxy handoff, then replaces itself with
+  the command; it does not replace PID 1.
+  This preserves parent-death cleanup across command startup and cancellation,
+  including hosts where an executable transition clears the inherited death signal.
+  When the initial command exits, Bubblewrap reports its status and terminates
+  remaining descendants through that same namespace owner.
 - When bubblewrap is active, the helper explicitly isolates the user namespace via
   `--unshare-user` and the PID namespace via `--unshare-pid`.
 - When bubblewrap is active and network is restricted without proxy routing, the helper also

@@ -36,6 +36,7 @@ use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+const TERMINATION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     /// Returns file descriptors that must stay open across the child `exec()`.
     ///
@@ -225,6 +226,9 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn terminate(&self) {
+        if self.has_observed_exit_and_closed_output() {
+            return;
+        }
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -237,19 +241,65 @@ impl UnifiedExecProcess {
         self.finish_termination();
     }
 
+    /// Request termination and await an observed exit plus closed output within one deadline.
+    /// A request acknowledgment or failed transport cannot establish that the process exited.
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
-        match &self.process_handle {
-            ProcessHandle::Local(process_handle) => process_handle.terminate(),
-            ProcessHandle::ExecServer(process_handle) => {
-                process_handle
-                    .terminate()
-                    .await
-                    .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
+        let confirmation = async {
+            if !self.has_observed_exit_and_closed_output() {
+                match &self.process_handle {
+                    ProcessHandle::Local(process_handle) => {
+                        process_handle.request_terminate().map_err(|_| {
+                            UnifiedExecError::process_failed(
+                                "process termination request failed".to_string(),
+                            )
+                        })?;
+                    }
+                    ProcessHandle::ExecServer(process_handle) => {
+                        process_handle.terminate().await.map_err(|_| {
+                            UnifiedExecError::process_failed(
+                                "process termination request failed".to_string(),
+                            )
+                        })?;
+                    }
+                }
             }
-        }
-        self.signal_exit(self.exit_code());
-        self.finish_termination();
-        Ok(())
+            let mut state_rx = self.state_rx.clone();
+            loop {
+                let output_closed = self.output.output_closed_notify.notified();
+                tokio::pin!(output_closed);
+                // Register before checking state so an output-close notification cannot be lost.
+                output_closed.as_mut().enable();
+                let state = state_rx.borrow_and_update().clone();
+                if state.failure_message.is_some() {
+                    return Err(UnifiedExecError::process_failed(
+                        "process exit cannot be confirmed after a transport failure".to_string(),
+                    ));
+                }
+                if state.exit_code.is_some() && self.output.output_closed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                tokio::select! {
+                    changed = state_rx.changed() => {
+                        changed.map_err(|_| UnifiedExecError::process_failed(
+                            "process exit observation ended before confirmation".to_string(),
+                        ))?;
+                    }
+                    _ = &mut output_closed => {}
+                }
+            }
+        };
+        tokio::time::timeout(TERMINATION_CONFIRMATION_TIMEOUT, confirmation)
+            .await
+            .map_err(|_| {
+                UnifiedExecError::process_failed(
+                    "process termination was not confirmed within 5 seconds".to_string(),
+                )
+            })?
+    }
+
+    fn has_observed_exit_and_closed_output(&self) -> bool {
+        self.state_rx.borrow().exit_code.is_some()
+            && self.output.output_closed.load(Ordering::Acquire)
     }
 
     pub(super) async fn interrupt(&self) -> Result<(), UnifiedExecError> {

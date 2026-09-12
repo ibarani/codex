@@ -113,46 +113,36 @@ async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result
 
     let output = tokio::time::timeout(config.timeout(), command.output())
         .await
-        .map_err(|_| {
-            io::Error::other(format!(
-                "provider auth command `{}` timed out after {} ms",
-                config.command,
-                config.timeout_ms.get()
-            ))
-        })?
-        .map_err(|err| {
-            io::Error::other(format!(
-                "provider auth command `{}` failed to start: {err}",
-                config.command
-            ))
-        })?;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "provider auth command timed out"))?
+        .map_err(|err| io::Error::new(err.kind(), "provider auth command failed to start"))?;
 
     if !output.status.success() {
         let status = output.status;
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stderr_suffix = if stderr.is_empty() {
-            String::new()
-        } else {
-            format!(": {stderr}")
-        };
+        // Credential helpers can write secrets to either stream. Only the
+        // process status is safe to forward to callers and diagnostic logs.
         return Err(io::Error::other(format!(
-            "provider auth command `{}` exited with status {status}{stderr_suffix}",
-            config.command
+            "provider auth command exited with status {status}"
         )));
     }
 
     let stdout = String::from_utf8(output.stdout).map_err(|_| {
-        io::Error::other(format!(
-            "provider auth command `{}` wrote non-UTF-8 data to stdout",
-            config.command
-        ))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider auth command wrote non-UTF-8 data to stdout",
+        )
     })?;
     let access_token = stdout.trim().to_string();
     if access_token.is_empty() {
-        return Err(io::Error::other(format!(
-            "provider auth command `{}` produced an empty token",
-            config.command
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider auth command produced an empty token",
+        ));
+    }
+    if http::HeaderValue::from_str(&format!("Bearer {access_token}")).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider auth command produced an invalid bearer token",
+        ));
     }
 
     Ok(access_token)
@@ -170,3 +160,7 @@ fn resolve_provider_auth_program(command: &str, cwd: &Path) -> io::Result<PathBu
 
     Ok(PathBuf::from(command))
 }
+
+#[cfg(test)]
+#[path = "external_bearer_tests.rs"]
+mod tests;

@@ -16,9 +16,9 @@ use codex_rollout_trace::ToolDispatchRequester;
 use codex_rollout_trace::ToolDispatchResult;
 use codex_rollout_trace::ToolDispatchTraceContext;
 
-/// Keeps registry early-return paths paired with trace end events.
+/// Pairs each admitted dispatch with one terminal, including dropped futures.
 pub(crate) struct ToolDispatchTrace {
-    context: ToolDispatchTraceContext,
+    context: Option<ToolDispatchTraceContext>,
 }
 
 impl ToolDispatchTrace {
@@ -28,34 +28,51 @@ impl ToolDispatchTrace {
             .services
             .rollout_thread_trace
             .start_tool_dispatch_trace(|| tool_dispatch_invocation(invocation));
-        Self { context }
+        Self {
+            context: Some(context),
+        }
     }
 
     pub(crate) fn record_completed(
-        &self,
+        mut self,
         invocation: &ToolInvocation,
         call_id: &str,
         payload: &ToolPayload,
         result: &dyn ToolOutput,
     ) {
-        if !self.context.is_enabled() {
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        if !context.is_enabled() {
             return;
         }
 
-        let Some(result_payload) = tool_dispatch_result(invocation, call_id, payload, result)
-        else {
-            return;
-        };
+        let result_payload = tool_dispatch_result(invocation, call_id, payload, result);
         let status = if result.success_for_logging() {
             ExecutionStatus::Completed
         } else {
             ExecutionStatus::Failed
         };
-        self.context.record_completed(status, result_payload);
+        context.record_completed(status, result_payload);
+        self.context = None;
     }
 
-    pub(crate) fn record_failed(&self, error: &FunctionCallError) {
-        self.context.record_failed(error);
+    pub(crate) fn record_failed(mut self, error: &FunctionCallError) {
+        if let Some(context) = self.context.take() {
+            context.record_failed(error);
+        }
+    }
+}
+
+impl Drop for ToolDispatchTrace {
+    fn drop(&mut self) {
+        if let Some(context) = self.context.take() {
+            if std::thread::panicking() {
+                context.record_failed("tool dispatch panicked before completion");
+            } else {
+                context.record_cancelled();
+            }
+        }
     }
 }
 
@@ -96,16 +113,16 @@ fn tool_dispatch_result(
     call_id: &str,
     payload: &ToolPayload,
     result: &dyn ToolOutput,
-) -> Option<ToolDispatchResult> {
+) -> ToolDispatchResult {
     match invocation.source {
         ToolCallSource::Direct | ToolCallSource::DirectPlaintextMessage => {
-            Some(ToolDispatchResult::DirectResponse {
+            ToolDispatchResult::DirectResponse {
                 response_item: result.to_response_item(call_id, payload),
-            })
+            }
         }
-        ToolCallSource::CodeMode { .. } => Some(ToolDispatchResult::CodeModeResponse {
+        ToolCallSource::CodeMode { .. } => ToolDispatchResult::CodeModeResponse {
             value: result.code_mode_result(payload),
-        }),
+        },
     }
 }
 

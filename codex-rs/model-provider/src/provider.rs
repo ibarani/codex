@@ -576,6 +576,7 @@ mod tests {
             auth: None,
             aws: None,
             wire_api: WireApi::Responses,
+            model_discovery: Default::default(),
             query_params: None,
             http_headers: None,
             env_http_headers: None,
@@ -1211,3 +1212,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "model_discovery_tests.rs"]
+mod model_discovery_tests;

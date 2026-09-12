@@ -295,6 +295,26 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
         profile_path_entry.display(),
     );
 
+    let sandbox = if use_sandbox {
+        // Only the capture counter is mutable; both commands must share the same cache identity.
+        let capture_path = home.path().join("captures");
+        std::fs::write(&capture_path, "")?;
+        let mut file_system = FileSystemSandboxPolicy::read_only();
+        file_system.entries.push(FileSystemSandboxEntry::new(
+            PathUri::from_host_native_path(&capture_path)?.into(),
+            FileSystemAccessMode::Write,
+        ));
+        Some(FileSystemSandboxContext::from_permission_profile_with_cwd(
+            PermissionProfile::from_runtime_permissions(
+                &file_system,
+                NetworkSandboxPolicy::Restricted,
+            ),
+            cwd.clone(),
+        ))
+    } else {
+        None
+    };
+
     for attempt in 0..2 {
         let started = context
             .backend
@@ -315,12 +335,7 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
                 tty,
                 pipe_stdin: false,
                 arg0: None,
-                sandbox: (use_sandbox && attempt == 0).then(|| {
-                    FileSystemSandboxContext::from_permission_profile_with_cwd(
-                        PermissionProfile::read_only(),
-                        cwd.clone(),
-                    )
-                }),
+                sandbox: sandbox.clone(),
                 enforce_managed_network: false,
                 managed_network: None,
                 network_proxy: None,
@@ -425,14 +440,16 @@ async fn shell_snapshot_v2_remote_managed_proxy_uses_prepared_execution_context(
 }
 
 #[cfg(unix)]
-#[test_case(false, false, "bash", 1; "local_pipe_recovery")]
-#[test_case(false, true, "bash", 1; "local_tty_recovery")]
-#[test_case(true, false, "bash", 1; "remote_pipe_recovery")]
-#[test_case(true, true, "bash", 1; "remote_tty_recovery")]
-#[test_case(false, false, "bash", 3; "local_retry_budget_exhausted")]
-#[test_case(true, false, "bash", 3; "remote_retry_budget_exhausted")]
-#[cfg_attr(target_os = "macos", test_case(false, false, "zsh", 1; "local_zsh_recovery"))]
-#[cfg_attr(target_os = "macos", test_case(true, false, "zsh", 1; "remote_zsh_recovery"))]
+#[test_case(false, false, "bash", 1, None; "local_pipe_recovery")]
+#[test_case(false, true, "bash", 1, None; "local_tty_recovery")]
+#[test_case(true, false, "bash", 1, None; "remote_pipe_recovery")]
+#[test_case(true, true, "bash", 1, None; "remote_tty_recovery")]
+#[test_case(false, false, "bash", 3, None; "local_retry_budget_exhausted")]
+#[test_case(true, false, "bash", 3, None; "remote_retry_budget_exhausted")]
+#[cfg_attr(target_os = "macos", test_case(false, false, "zsh", 1, None; "local_zsh_recovery"))]
+#[cfg_attr(target_os = "macos", test_case(true, false, "zsh", 1, None; "remote_zsh_recovery"))]
+#[test_case(false, false, "bash", 1, Some("SSH_CLIENT"); "local_ssh_client_recovery")]
+#[test_case(false, true, "bash", 1, Some("SSH2_CLIENT"); "local_ssh2_client_recovery")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(remote_exec_server)]
 async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
@@ -440,6 +457,7 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
     tty: bool,
     shell_name: &str,
     failures_before_repair: usize,
+    remote_startup_env: Option<&str>,
 ) -> Result<()> {
     if use_remote
         && let Some(warning) =
@@ -487,7 +505,12 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
                 path: shell_path.to_string(),
             },
         }),
-        env: HashMap::new(),
+        // Explicit request overrides reproduce Bash's remote-startup detection without
+        // mutating the shared test environment or opening a network connection.
+        env: remote_startup_env
+            .map(|name| (name.to_string(), "synthetic-remote-session".to_string()))
+            .into_iter()
+            .collect(),
         tty,
         pipe_stdin: false,
         arg0: None,

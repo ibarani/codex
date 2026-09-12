@@ -2,3 +2,4 @@
 mod bundled_bwrap;
 mod landlock;
 mod managed_proxy;
+mod process_lifecycle;

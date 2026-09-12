@@ -216,25 +216,39 @@ impl ProcessHandle {
         }
     }
 
-    /// Attempts to kill the child while leaving the reader/writer tasks alive
-    /// so callers can still drain output until EOF.
-    pub fn request_terminate(&self) {
-        if let Ok(mut killer_opt) = self.killer.lock()
-            && let Some(mut killer) = killer_opt.take()
-        {
-            let _ = killer.kill();
+    /// Request termination while leaving I/O tasks alive to drain output until EOF.
+    ///
+    /// A successful request is not an observed exit. Failed requests retain the
+    /// terminator so a caller can retry; a successful request is sent only once.
+    /// Errors preserve their kind without exposing backend-provided text.
+    pub fn request_terminate(&self) -> io::Result<()> {
+        let mut killer_opt = self
+            .killer
+            .lock()
+            .map_err(|_| io::Error::other("process terminator lock is poisoned"))?;
+        if let Some(killer) = killer_opt.as_mut() {
+            killer.kill().map_err(|error| {
+                io::Error::new(error.kind(), "process termination request failed")
+            })?;
+            killer_opt.take();
         }
+        Ok(())
     }
 
+    /// Send a process signal, retaining the terminator when the request fails.
+    /// Successful Windows interrupts consume it because they terminate the backend.
     pub fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
-        let Ok(mut killer_opt) = self.killer.lock() else {
-            return Ok(());
-        };
+        let mut killer_opt = self
+            .killer
+            .lock()
+            .map_err(|_| io::Error::other("process terminator lock is poisoned"))?;
         let Some(killer) = killer_opt.as_mut() else {
             return Ok(());
         };
 
-        let result = killer.signal(signal);
+        let result = killer
+            .signal(signal)
+            .map_err(|error| io::Error::new(error.kind(), "process signal request failed"));
         #[cfg(windows)]
         if result.is_ok() {
             killer_opt.take();
@@ -242,9 +256,20 @@ impl ProcessHandle {
         result
     }
 
-    /// Attempts to kill the child and abort I/O helper tasks.
+    /// Best-effort termination followed by aborting I/O helper tasks.
+    /// Failed requests produce a bounded diagnostic and retain the terminator;
+    /// use `request_terminate` when the caller must handle failure or drain output.
     pub fn terminate(&self) {
-        self.request_terminate();
+        if let Err(error) = self.request_terminate() {
+            use std::io::Write as _;
+
+            // Drop has no error return; diagnostic failure must not interrupt cleanup.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "process termination request failed ({:?})",
+                error.kind(),
+            );
+        }
 
         if let Ok(mut h) = self.reader_handle.lock()
             && let Some(handle) = h.take()
@@ -479,3 +504,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         exit_rx: exit_rx_out,
     }
 }
+
+#[cfg(test)]
+#[path = "process_tests.rs"]
+mod tests;

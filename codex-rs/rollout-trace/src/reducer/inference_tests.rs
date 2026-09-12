@@ -1,6 +1,5 @@
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tempfile::TempDir;
 
 use crate::model::ConversationItemKind;
 use crate::model::ExecutionStatus;
@@ -9,12 +8,13 @@ use crate::raw_event::RawTraceEventPayload;
 use crate::reducer::test_support::append_inference_start;
 use crate::reducer::test_support::create_started_writer;
 use crate::reducer::test_support::message;
+use crate::reducer::test_support::private_tempdir;
 use crate::reducer::test_support::start_turn;
 use crate::replay_bundle;
 
 #[test]
 fn cancelled_inference_reduces_partial_response_items() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -71,7 +71,7 @@ fn cancelled_inference_reduces_partial_response_items() -> anyhow::Result<()> {
 
 #[test]
 fn cancelled_turn_closes_running_inference_call() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -98,7 +98,7 @@ fn cancelled_turn_closes_running_inference_call() -> anyhow::Result<()> {
 
 #[test]
 fn late_cancelled_inference_preserves_turn_end_status() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 

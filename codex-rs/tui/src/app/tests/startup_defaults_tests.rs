@@ -362,8 +362,17 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
         let (mut app, _, _) = make_test_app_with_channels().await;
         app.chat_widget.handle_thread_session_quiet(started.session);
         if !remote {
-            let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80)
-                .replace(&destination.path().display().to_string(), "<PROJECT>");
+            // This snapshot tests destination/model selection, not path clipping.
+            // Admit the entire real fixture path before normalizing it.
+            let directory = destination.path().display().to_string();
+            let width = u16::try_from(80 + crate::width::display_width(&directory))
+                .expect("fixture footer width");
+            let rendered = render_bottom_popup(&app.chat_widget, width);
+            assert!(
+                rendered.contains(&directory),
+                "complete destination must be rendered"
+            );
+            let rendered = rendered.replace(&directory, "<PROJECT>");
             insta::assert_snapshot!(rendered, @r"
             › Ask Codex to do anything
 

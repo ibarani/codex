@@ -1,6 +1,9 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use codex_protocol::protocol::PatchApplyBeginEvent;
+use codex_protocol::protocol::PatchApplyEndEvent;
+use codex_protocol::protocol::PatchApplyStatus;
 
 use super::TraceReducer;
 use crate::model::CodeModeRuntimeToolId;
@@ -314,6 +317,45 @@ impl TraceReducer {
                 tool_call.terminal_operation_id.clone(),
             )
         };
+
+        let tool = &self.rollout.tool_calls[&tool_call_id];
+        if matches!(
+            tool.kind,
+            ToolCallKind::ExecCommand | ToolCallKind::ApplyPatch
+        ) {
+            let end = self.read_payload_json(&runtime_payload)?;
+            let first_payload = tool
+                .raw_runtime_payload_ids
+                .first()
+                .and_then(|id| self.payloads.get(id))
+                .context("tool runtime end has no admitted runtime payload")?;
+            let start: serde_json::Value = serde_json::from_slice(first_payload)?;
+            if matches!(tool.kind, ToolCallKind::ApplyPatch)
+                || start.get("auto_approved").is_some()
+                || start.get("changes").is_some()
+                || end.get("success").is_some()
+                || end.get("changes").is_some()
+            {
+                let patch_start: PatchApplyBeginEvent = serde_json::from_value(start)?;
+                let patch_end: PatchApplyEndEvent = serde_json::from_value(end.clone())?;
+                let patch_status = match patch_end.status {
+                    PatchApplyStatus::Completed => ExecutionStatus::Completed,
+                    PatchApplyStatus::Failed => ExecutionStatus::Failed,
+                    PatchApplyStatus::Declined => ExecutionStatus::Cancelled,
+                };
+                if terminal_operation_id.is_some()
+                    || tool.raw_runtime_payload_ids.len() != 2
+                    || end.get("command").is_some()
+                    || patch_start.call_id != tool_call_id
+                    || patch_end.call_id != tool_call_id
+                    || patch_end.turn_id != patch_start.turn_id
+                    || patch_end.success != (patch_status == ExecutionStatus::Completed)
+                    || patch_status != status
+                {
+                    bail!("patch runtime end disagrees with its start or outcome");
+                }
+            }
+        }
 
         if let Some(operation_id) = terminal_operation_id {
             self.end_terminal_operation(

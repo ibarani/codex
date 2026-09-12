@@ -29,7 +29,8 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_rollout_trace::REDUCED_STATE_FILE_NAME;
-use codex_rollout_trace::replay_bundle;
+use codex_rollout_trace::reduce_to_file;
+use codex_rollout_trace::write_evidence;
 use codex_state::StateRuntime;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
@@ -268,6 +269,10 @@ enum DebugSubcommand {
     #[clap(hide = true)]
     TraceReduce(DebugTraceReduceCommand),
 
+    /// Stream private admitted trace evidence to a nonterminal destination.
+    #[clap(hide = true)]
+    TraceEvidence(DebugTraceEvidenceCommand),
+
     /// Internal: reset local memory state for a fresh start.
     #[clap(hide = true)]
     ClearMemories,
@@ -328,6 +333,13 @@ struct DebugTraceReduceCommand {
     /// Output path for reduced RolloutTrace JSON. Defaults to TRACE_BUNDLE/state.json.
     #[arg(long = "output", short = 'o', value_name = "FILE")]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct DebugTraceEvidenceCommand {
+    /// Trace bundle to admit once and project as a private evidence stream.
+    #[arg(value_name = "TRACE_BUNDLE")]
+    trace_bundle: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -1772,6 +1784,14 @@ async fn cli_main(
                 )?;
                 run_debug_trace_reduce_command(cmd).await?;
             }
+            DebugSubcommand::TraceEvidence(cmd) => {
+                reject_remote_mode_for_subcommand(
+                    root_remote.as_deref(),
+                    root_remote_auth_token_env.as_deref(),
+                    "debug trace-evidence",
+                )?;
+                run_debug_trace_evidence_command(cmd)?;
+            }
             DebugSubcommand::ClearMemories => {
                 reject_remote_mode_for_subcommand(
                     root_remote.as_deref(),
@@ -2270,12 +2290,19 @@ async fn run_debug_trace_reduce_command(cmd: DebugTraceReduceCommand) -> anyhow:
         .output
         .unwrap_or_else(|| cmd.trace_bundle.join(REDUCED_STATE_FILE_NAME));
 
-    let trace = replay_bundle(&cmd.trace_bundle)?;
-    let reduced_json = serde_json::to_vec_pretty(&trace)?;
-    tokio::fs::write(&output, reduced_json).await?;
+    reduce_to_file(&cmd.trace_bundle, &output)?;
     println!("{}", output.display());
 
     Ok(())
+}
+
+fn run_debug_trace_evidence_command(cmd: DebugTraceEvidenceCommand) -> anyhow::Result<()> {
+    let output = std::io::stdout();
+    anyhow::ensure!(
+        !output.is_terminal(),
+        "trace evidence requires a private pipe or file, not a terminal"
+    );
+    write_evidence(&cmd.trace_bundle, &mut output.lock())
 }
 
 async fn run_debug_prompt_input_command(
@@ -3661,6 +3688,36 @@ mod tests {
         };
 
         assert!(cmd.bundled);
+    }
+
+    #[test]
+    fn debug_trace_evidence_requires_an_explicit_bundle() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "debug",
+            "trace-evidence",
+            "/private/trace-bundle",
+        ])
+        .expect("parse");
+        let Some(Subcommand::Debug(DebugCommand {
+            subcommand: DebugSubcommand::TraceEvidence(cmd),
+        })) = cli.subcommand
+        else {
+            panic!("expected debug trace-evidence subcommand");
+        };
+        assert_eq!(cmd.trace_bundle, PathBuf::from("/private/trace-bundle"));
+        assert!(MultitoolCli::try_parse_from(["codex", "debug", "trace-evidence"]).is_err());
+        assert!(
+            MultitoolCli::try_parse_from([
+                "codex",
+                "debug",
+                "trace-evidence",
+                "/private/trace-bundle",
+                "--output",
+                "/private/another-copy",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

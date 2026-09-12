@@ -1,17 +1,18 @@
 use crate::PluginGitMode;
+use crate::background_tasks::PluginCancellation;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::process::Output;
-use std::process::Stdio;
 use std::time::Duration;
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 
 pub(super) fn git_remote_revision(
     codex_home: &Path,
     source: &str,
     ref_name: Option<&str>,
-    timeout: Duration,
     mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<String, String> {
     if let Some(ref_name) = ref_name
         && is_full_git_sha(ref_name)
@@ -24,10 +25,11 @@ pub(super) fn git_remote_revision(
     let _trusted_repository = matches!(mode, PluginGitMode::Automatic)
         .then(|| crate::configure_trusted_git_repository(&mut command, codex_home))
         .transpose()?;
-    let output = run_git_command_with_timeout(
-        command.arg("ls-remote").arg(source).arg(ref_name),
+    command.arg("ls-remote").arg(source).arg(ref_name);
+    let output = cancellation.git(
+        command,
         "git ls-remote marketplace source",
-        timeout,
+        Some(GIT_TIMEOUT),
     )?;
     ensure_git_success(&output, "git ls-remote marketplace source")?;
 
@@ -53,8 +55,8 @@ pub(super) fn clone_git_source(
     ref_name: Option<&str>,
     sparse_paths: &[String],
     destination: &Path,
-    timeout: Duration,
     mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<String, String> {
     let git_destination = git_path_arg(destination);
     let mut command = git_command(mode);
@@ -62,37 +64,31 @@ pub(super) fn clone_git_source(
         .then(|| crate::configure_trusted_git_repository(&mut command, codex_home))
         .transpose()?;
     if sparse_paths.is_empty() {
-        let output = run_git_command_with_timeout(
-            command.arg("clone").arg(source).arg(&git_destination),
-            "git clone marketplace source",
-            timeout,
-        )?;
+        command.arg("clone").arg(source).arg(&git_destination);
+        let output =
+            cancellation.git(command, "git clone marketplace source", Some(GIT_TIMEOUT))?;
         ensure_git_success(&output, "git clone marketplace source")?;
         if let Some(ref_name) = ref_name {
-            let output = run_git_command_with_timeout(
-                git_command(mode)
-                    .arg("-C")
-                    .arg(&git_destination)
-                    .arg("checkout")
-                    .arg(ref_name),
-                "git checkout marketplace ref",
-                timeout,
-            )?;
+            let mut checkout = git_command(mode);
+            checkout
+                .arg("-C")
+                .arg(&git_destination)
+                .arg("checkout")
+                .arg(ref_name);
+            let output =
+                cancellation.git(checkout, "git checkout marketplace ref", Some(GIT_TIMEOUT))?;
             ensure_git_success(&output, "git checkout marketplace ref")?;
         }
-        return git_worktree_revision(&git_destination, timeout, mode);
+        return git_worktree_revision(&git_destination, mode, cancellation);
     }
 
-    let output = run_git_command_with_timeout(
-        command
-            .arg("clone")
-            .arg("--filter=blob:none")
-            .arg("--no-checkout")
-            .arg(source)
-            .arg(&git_destination),
-        "git clone marketplace source",
-        timeout,
-    )?;
+    command
+        .arg("clone")
+        .arg("--filter=blob:none")
+        .arg("--no-checkout")
+        .arg(source)
+        .arg(&git_destination);
+    let output = cancellation.git(command, "git clone marketplace source", Some(GIT_TIMEOUT))?;
     ensure_git_success(&output, "git clone marketplace source")?;
 
     let mut sparse_checkout = git_command(mode);
@@ -102,39 +98,39 @@ pub(super) fn clone_git_source(
         .arg("sparse-checkout")
         .arg("set")
         .args(sparse_paths);
-    let output = run_git_command_with_timeout(
-        &mut sparse_checkout,
+    let output = cancellation.git(
+        sparse_checkout,
         "git sparse-checkout marketplace source",
-        timeout,
+        Some(GIT_TIMEOUT),
     )?;
     ensure_git_success(&output, "git sparse-checkout marketplace source")?;
 
-    let output = run_git_command_with_timeout(
-        git_command(mode)
-            .arg("-C")
-            .arg(&git_destination)
-            .arg("checkout")
-            .arg(ref_name.unwrap_or("HEAD")),
-        "git checkout marketplace ref",
-        timeout,
-    )?;
+    let mut checkout = git_command(mode);
+    checkout
+        .arg("-C")
+        .arg(&git_destination)
+        .arg("checkout")
+        .arg(ref_name.unwrap_or("HEAD"));
+    let output = cancellation.git(checkout, "git checkout marketplace ref", Some(GIT_TIMEOUT))?;
     ensure_git_success(&output, "git checkout marketplace ref")?;
-    git_worktree_revision(&git_destination, timeout, mode)
+    git_worktree_revision(&git_destination, mode, cancellation)
 }
 
 fn git_worktree_revision(
     destination: &Path,
-    timeout: Duration,
     mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<String, String> {
-    let output = run_git_command_with_timeout(
-        git_command(mode)
-            .arg("-C")
-            .arg(destination)
-            .arg("rev-parse")
-            .arg("HEAD"),
+    let mut command = git_command(mode);
+    command
+        .arg("-C")
+        .arg(destination)
+        .arg("rev-parse")
+        .arg("HEAD");
+    let output = cancellation.git(
+        command,
         "git rev-parse marketplace revision",
-        timeout,
+        Some(GIT_TIMEOUT),
     )?;
     ensure_git_success(&output, "git rev-parse marketplace revision")?;
 
@@ -180,50 +176,7 @@ fn strip_windows_verbatim_path_prefix(path: &str) -> Option<String> {
     Some(stripped)
 }
 
-fn run_git_command_with_timeout(
-    command: &mut Command,
-    context: &str,
-    timeout: Duration,
-) -> Result<Output, String> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {context}: {err}"))?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|err| format!("failed to wait for {context}: {err}"));
-            }
-            Ok(None) => {}
-            Err(err) => return Err(format!("failed to poll {context}: {err}")),
-        }
-
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .map_err(|err| format!("failed to wait for {context} after timeout: {err}"))?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return if stderr.is_empty() {
-                Err(format!("{context} timed out after {}s", timeout.as_secs()))
-            } else {
-                Err(format!(
-                    "{context} timed out after {}s: {stderr}",
-                    timeout.as_secs()
-                ))
-            };
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
+fn ensure_git_success(output: &std::process::Output, context: &str) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }

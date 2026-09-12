@@ -575,7 +575,17 @@ where
     }
 }
 
-fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAttempt> {
+fn started_inference_attempt() -> anyhow::Result<(TempDir, InferenceTraceAttempt)> {
+    #[cfg(unix)]
+    let temp = {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?
+    };
+    #[cfg(not(unix))]
+    let temp = TempDir::new()?;
     let writer = Arc::new(TraceWriter::create(
         temp.path(),
         "trace-1".to_string(),
@@ -608,7 +618,7 @@ fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAtt
             "content": [{"type": "input_text", "text": "hello"}]
         }],
     }));
-    Ok(attempt)
+    Ok((temp, attempt))
 }
 
 fn output_message(id: &str, text: &str) -> ResponseItem {
@@ -791,8 +801,7 @@ async fn summarize_memories_returns_empty_for_empty_input() {
 
 #[tokio::test]
 async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let attempt = started_inference_attempt(&temp)?;
+    let (temp, attempt) = started_inference_attempt()?;
 
     // The provider has produced one complete output item, but no terminal
     // response.completed event. The harness has enough information to keep this
@@ -1055,8 +1064,7 @@ async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_fail
 #[tokio::test]
 async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
 -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let attempt = started_inference_attempt(&temp)?;
+    let (temp, attempt) = started_inference_attempt()?;
     let backpressured_item_yielded = Arc::new(Notify::new());
     let mut events = VecDeque::new();
     for _ in 0..super::RESPONSE_STREAM_CHANNEL_CAPACITY {

@@ -176,6 +176,20 @@ impl ToolDispatchTraceContext {
         append_tool_call_ended(context, status, &response);
     }
 
+    /// Records cancellation of an admitted dispatch, without inventing a tool result.
+    pub fn record_cancelled(&self) {
+        let ToolDispatchTraceContextState::Enabled(context) = &self.state else {
+            return;
+        };
+        append_tool_call_ended(
+            context,
+            ExecutionStatus::Cancelled,
+            &DispatchedToolTraceResponse::Error {
+                error: "tool dispatch cancelled before completion".to_string(),
+            },
+        );
+    }
+
     /// Records a dispatch failure before the tool produced a normal result payload.
     pub fn record_failed(&self, error: impl Display) {
         let ToolDispatchTraceContextState::Enabled(context) = &self.state else {

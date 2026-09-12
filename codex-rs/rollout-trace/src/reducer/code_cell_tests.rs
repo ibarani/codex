@@ -1,6 +1,5 @@
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tempfile::TempDir;
 
 use crate::model::CodeCellRuntimeStatus;
 use crate::model::ConversationItemKind;
@@ -13,6 +12,7 @@ use crate::raw_event::RawToolCallRequester;
 use crate::raw_event::RawTraceEventPayload;
 use crate::reducer::test_support::create_started_writer;
 use crate::reducer::test_support::message;
+use crate::reducer::test_support::private_tempdir;
 use crate::reducer::test_support::start_turn;
 use crate::reducer::test_support::start_turn_for_thread;
 use crate::reducer::test_support::trace_context;
@@ -21,7 +21,7 @@ use crate::replay_bundle;
 
 #[test]
 fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -191,7 +191,7 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
 
 #[test]
 fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -270,7 +270,7 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
 
 #[test]
 fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -335,7 +335,7 @@ fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()> {
 
 #[test]
 fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     writer.append(RawTraceEventPayload::ThreadStarted {
         thread_id: "thread-child".to_string(),

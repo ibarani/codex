@@ -23,7 +23,9 @@ use std::time::Duration;
 use crate::bwrap::BwrapNetworkMode;
 use crate::bwrap::BwrapOptions;
 use crate::bwrap::create_bwrap_command_args;
+use crate::landlock::NetworkSeccompMode;
 use crate::landlock::apply_permission_profile_to_current_thread;
+use crate::landlock::network_seccomp_filter_file;
 use crate::launcher::exec_bwrap;
 use crate::launcher::preferred_bwrap_supports_argv0;
 use crate::proxy_routing::activate_proxy_routes_in_netns;
@@ -114,8 +116,8 @@ pub struct LandlockCommand {
     #[arg(long = "use-legacy-landlock", hide = true, default_value_t = false)]
     pub use_legacy_landlock: bool,
 
-    /// Internal: apply seccomp and `no_new_privs` in the already-sandboxed
-    /// process, then exec the user command.
+    /// Internal: verify the already-sandboxed process, finish proxy handoff,
+    /// then exec the user command with Bubblewrap's inherited seccomp filter.
     ///
     /// This exists so we can run bubblewrap first (which may rely on setuid)
     /// and only tighten with seccomp after the filesystem view is established.
@@ -189,8 +191,8 @@ pub fn run_main() -> ! {
         &sandbox_policy_cwd,
     );
 
-    // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
-    // established the filesystem view.
+    // Inner stage: Bubblewrap has established the filesystem view and applied
+    // any required network filter to both its init and this command process.
     if apply_seccomp_then_exec {
         if let Err(err) = crate::fd_mount::verify_fd_mounts(&verify_fd_mounts) {
             panic!("failed to verify descriptor-backed bubblewrap mount: {err}");
@@ -228,50 +230,9 @@ pub fn run_main() -> ! {
                 panic!("error activating Linux proxy routing bridge: {err}");
             }
         }
-        let proxy_routing_active = allow_network_for_proxy;
-        if let Err(e) = apply_permission_profile_to_current_thread(
-            &permission_profile,
-            &sandbox_policy_cwd,
-            /*apply_landlock_fs*/ false,
-            allow_network_for_proxy,
-            proxy_routing_active,
-        ) {
-            panic!("error applying Linux sandbox restrictions: {e:?}");
-        }
-
-        let signal_mask = ForwardedSignalMask::block();
-        let command_pid = unsafe { libc::fork() };
-        if command_pid < 0 {
-            let err = std::io::Error::last_os_error();
-            panic!("failed to fork sandboxed command: {err}");
-        }
-
-        if command_pid == 0 {
-            reset_forwarded_signal_handlers_to_default();
-            signal_mask.restore();
-            exec_or_panic(command);
-        }
-
-        let signal_forwarders = install_bwrap_signal_forwarders(command_pid);
-        signal_mask.restore();
-        loop {
-            let mut status = 0;
-            let reaped_pid = unsafe { libc::waitpid(-1, &mut status, 0) };
-            if reaped_pid == command_pid {
-                let exit_signal_mask = ForwardedSignalMask::block();
-                signal_forwarders.restore();
-                exit_signal_mask.restore();
-                exit_with_wait_status(status);
-            }
-            if reaped_pid >= 0 {
-                continue;
-            }
-
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EINTR) {
-                panic!("failed to reap sandboxed child: {err}");
-            }
-        }
+        // Bubblewrap's non-exec namespace init owns reaping and parent-death cleanup.
+        // Replacing PID 1 with this executable can clear its inherited death signal.
+        exec_or_panic(command);
     }
 
     if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {
@@ -289,7 +250,7 @@ pub fn run_main() -> ! {
 
     if !use_legacy_landlock {
         // Outer stage: bubblewrap first, then re-enter this binary in the
-        // sandboxed environment to apply seccomp. This path never falls back
+        // sandboxed environment to finish setup. This path never falls back
         // to legacy Landlock on failure.
         let (proxy_route_spec, proxy_controls) = if allow_network_for_proxy {
             let (proxy_route_spec, controls) = prepare_host_proxy_route_spec()
@@ -424,6 +385,20 @@ fn run_bwrap_with_proc_fallback(
         options,
     )
     .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
+    let seccomp_mode = match network_mode {
+        BwrapNetworkMode::FullAccess => None,
+        BwrapNetworkMode::Isolated => Some(NetworkSeccompMode::Restricted),
+        BwrapNetworkMode::ProxyOnly => Some(NetworkSeccompMode::ProxyRouted),
+    };
+    if let Some(mode) = seccomp_mode {
+        let filter = network_seccomp_filter_file(mode)
+            .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
+        bwrap_args.args.splice(
+            1..1,
+            ["--seccomp".to_string(), filter.as_raw_fd().to_string()],
+        );
+        bwrap_args.preserved_files.push(filter);
+    }
     bwrap_args.preserved_files.extend(proxy_controls);
     apply_inner_command_argv0(&mut bwrap_args.args);
     run_or_exec_bwrap(bwrap_args);
@@ -1246,9 +1221,17 @@ fn make_directory_tree_writable(path: &Path) -> std::io::Result<()> {
 
 fn remove_synthetic_mount_target(target: &crate::bwrap::SyntheticMountTarget) {
     let path = target.path();
+    // A non-directory ancestor also means the synthetic descendant no longer exists.
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return;
+        }
         Err(err) => panic!(
             "failed to inspect synthetic bubblewrap mount target {}: {err}",
             path.display()
@@ -1260,7 +1243,11 @@ fn remove_synthetic_mount_target(target: &crate::bwrap::SyntheticMountTarget) {
     match target.kind() {
         crate::bwrap::SyntheticMountTargetKind::EmptyFile => match fs::remove_file(path) {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
             Err(err) => panic!(
                 "failed to remove synthetic bubblewrap mount target {}: {err}",
                 path.display()
@@ -1268,7 +1255,11 @@ fn remove_synthetic_mount_target(target: &crate::bwrap::SyntheticMountTarget) {
         },
         crate::bwrap::SyntheticMountTargetKind::EmptyDirectory => match fs::remove_dir(path) {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
             Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
             Err(err) => panic!(
                 "failed to remove synthetic bubblewrap mount target {}: {err}",

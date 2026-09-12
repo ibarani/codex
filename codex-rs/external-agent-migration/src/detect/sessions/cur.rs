@@ -1,3 +1,9 @@
+//! Cursor project names encode both path boundaries and punctuation as dashes.
+//! Non-Windows decoding probes generated path partitions under an input-proportional
+//! work budget, rejecting ambiguity or incomplete search. Unrelated directory entries
+//! do not affect admission; native lookup owns case, normalization, and symlink behavior.
+//! Windows retains its existing decoder pending native platform qualification.
+
 use super::common::SessionFileCandidate;
 use super::common::detect_recent_sessions;
 use crate::model::ExternalAgentSessionImportLimits;
@@ -8,9 +14,15 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(windows)]
 const MAX_CUR_PROJECT_PATH_PROBES: usize = 128;
 const CUR_PROJECT_SEPARATORS: [&str; 11] =
     ["-", "_", ".", " ", "--", "..", "__", "  ", "+", "@", "&"];
+// Each prefix has one literal candidate and at most three merge lengths.
+// Budget one complete prefix expansion per encoded component. Extra ambiguous
+// branches share that finite budget and exhaustion never establishes uniqueness.
+#[cfg(not(windows))]
+const CUR_PROJECT_PATH_PROBES_PER_COMPONENT: usize = 1 + 3 * CUR_PROJECT_SEPARATORS.len();
 
 pub fn detect_recent_cur_sessions(
     external_agent_home: &Path,
@@ -97,6 +109,79 @@ fn cur_project_cwd(project_storage: &Path, external_agent_home: &Path) -> Option
     decode_cur_project_path(encoded)
 }
 
+#[cfg(not(windows))]
+fn decode_cur_project_path(encoded: &str) -> Option<PathBuf> {
+    let encoded = encoded.strip_prefix('-').unwrap_or(encoded);
+    let components: Vec<_> = encoded.split('-').collect();
+    if components.iter().any(|component| {
+        component.is_empty()
+            || matches!(*component, "." | "..")
+            || component.contains(['/', '\\', ':'])
+    }) {
+        return None;
+    }
+    let max_probes = components
+        .len()
+        .checked_mul(CUR_PROJECT_PATH_PROBES_PER_COMPONENT)?;
+    resolve_cur_project_components(Path::new("/"), &components, max_probes)
+}
+
+/// Resolves one complete, unambiguous lexical path without canonicalizing away
+/// symlink aliases. Every resolved prefix shares the same native probe budget.
+#[cfg(not(windows))]
+fn resolve_cur_project_components(
+    root: &Path,
+    components: &[&str],
+    max_probes: usize,
+) -> Option<PathBuf> {
+    let mut pending = vec![(root.to_path_buf(), 0)];
+    let mut matched_path = None;
+    let mut probes = 0;
+    while let Some((parent, consumed)) = pending.pop() {
+        if consumed == components.len() {
+            if matched_path
+                .as_ref()
+                .is_some_and(|matched| matched != &parent)
+            {
+                return None;
+            }
+            matched_path = Some(parent);
+            continue;
+        }
+        for length in 1..=4.min(components.len() - consumed) {
+            let separators = if length == 1 {
+                &[""][..]
+            } else {
+                &CUR_PROJECT_SEPARATORS[..]
+            };
+            for separator in separators {
+                if probes >= max_probes {
+                    return None;
+                }
+                probes += 1;
+                let name = components[consumed..consumed + length].join(separator);
+                let candidate = parent.join(name);
+                match fs::metadata(&candidate) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        pending.push((candidate, consumed + length));
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+    matched_path
+}
+
+// Keep the existing Windows decoder until the generated-probe traversal has
+// actual Windows qualification for drive paths and native filename aliases.
+#[cfg(windows)]
 fn decode_cur_project_path(encoded: &str) -> Option<PathBuf> {
     #[cfg(not(windows))]
     let mut path = PathBuf::from("/");

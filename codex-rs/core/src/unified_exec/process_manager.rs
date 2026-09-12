@@ -1690,10 +1690,17 @@ impl UnifiedExecProcessManager {
             entries
         };
 
-        for entry in entries {
+        futures::future::join_all(entries.into_iter().map(|entry| async move {
             unregister_network_approval_for_entry(&entry).await;
-            entry.process.terminate();
-        }
+            if entry.process.terminate_confirmed().await.is_err() {
+                tracing::warn!(
+                    process_id = entry.process_id,
+                    "unified exec process termination could not be confirmed"
+                );
+                entry.process.terminate();
+            }
+        }))
+        .await;
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {
@@ -1716,15 +1723,15 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
-        let (process, already_exited) = {
+        let process = {
             let store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return false;
             };
-            (Arc::clone(&entry.process), entry.process.has_exited())
+            Arc::clone(&entry.process)
         };
 
-        if !already_exited && process.terminate_confirmed().await.is_err() {
+        if process.terminate_confirmed().await.is_err() {
             return false;
         }
 

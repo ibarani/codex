@@ -20,7 +20,7 @@ pub enum CargoBinError {
         #[source]
         source: std::io::Error,
     },
-    #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but it does not exist")]
+    #[error("binary path from {key} resolved to {path:?}, but it is not a file")]
     ResolvedPathDoesNotExist { key: String, path: PathBuf },
     #[error("could not locate binary {name:?}; tried env vars {env_keys:?}; {fallback}")]
     NotFound {
@@ -32,53 +32,96 @@ pub enum CargoBinError {
 
 /// Returns an absolute path to a binary target built for the current test run.
 ///
-/// In `cargo test`, `CARGO_BIN_EXE_*` env vars are absolute.
-/// In `bazel test`, `CARGO_BIN_EXE_*` env vars are rlocationpaths, intended to be consumed by `rlocation`.
-/// This helper allows callers to transparently support both.
+/// Bazel's `CARGO_BIN_EXE_*` values are resolved through runfiles. Otherwise,
+/// nextest's remapped `NEXTEST_BIN_EXE_*` paths precede Cargo's absolute paths.
+/// These variables cover the current package, not every workspace binary.
+///
+/// Cross-package lookup retains the existing Cargo layout fallback. With a
+/// separate build directory, both `CARGO_BUILD_BUILD_DIR` and `CARGO_TARGET_DIR`
+/// must be absolute: the profile and optional target suffix are carried from
+/// the former to the latter. Relative roots and unknown layouts are rejected.
+/// This function never builds a binary or searches `PATH`.
 #[allow(deprecated)]
 pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
-    let env_keys = cargo_bin_env_keys(name);
+    let prefixes = if runfiles_available() {
+        &["CARGO_BIN_EXE"][..]
+    } else {
+        &["NEXTEST_BIN_EXE", "CARGO_BIN_EXE"][..]
+    };
+    let env_keys = cargo_bin_env_keys(name, prefixes);
     for key in &env_keys {
         if let Some(value) = std::env::var_os(key) {
             return resolve_bin_from_env(key, value);
         }
     }
-    match assert_cmd::Command::cargo_bin(name) {
-        Ok(cmd) => {
-            let mut path = PathBuf::from(cmd.get_program());
-            if !path.is_absolute() {
-                path = std::env::current_dir()
-                    .map_err(|source| CargoBinError::CurrentDir { source })?
-                    .join(path);
-            }
-            if path.exists() {
-                Ok(path)
-            } else {
-                Err(CargoBinError::ResolvedPathDoesNotExist {
-                    key: "assert_cmd::Command::cargo_bin".to_owned(),
-                    path,
-                })
-            }
-        }
-        Err(err) => Err(CargoBinError::NotFound {
+    // The existing fallback knows the running test's profile and target suffix,
+    // but assert_cmd assumes final binaries also live in that build directory.
+    let candidate = assert_cmd::cargo::cargo_bin(name);
+    let build_dir = std::env::var_os("CARGO_BUILD_BUILD_DIR").map(PathBuf::from);
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let path = relocate_cargo_bin(&candidate, build_dir.as_deref(), target_dir.as_deref())
+        .map_err(|message| CargoBinError::NotFound {
             name: name.to_owned(),
-            env_keys,
-            fallback: format!("assert_cmd fallback failed: {err}"),
-        }),
+            env_keys: env_keys.clone(),
+            fallback: message.to_owned(),
+        })?;
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(CargoBinError::ResolvedPathDoesNotExist {
+            key: "Cargo layout fallback".to_owned(),
+            path,
+        })
     }
 }
 
-fn cargo_bin_env_keys(name: &str) -> Vec<String> {
-    let mut keys = Vec::with_capacity(2);
-    keys.push(format!("CARGO_BIN_EXE_{name}"));
-
-    // Cargo replaces dashes in target names when exporting env vars.
+fn cargo_bin_env_keys(name: &str, prefixes: &[&str]) -> Vec<String> {
+    let mut keys = Vec::with_capacity(prefixes.len() * 2);
     let underscore_name = name.replace('-', "_");
-    if underscore_name != name {
-        keys.push(format!("CARGO_BIN_EXE_{underscore_name}"));
+    for prefix in prefixes {
+        keys.push(format!("{prefix}_{name}"));
+        if underscore_name != name {
+            keys.push(format!("{prefix}_{underscore_name}"));
+        }
     }
-
     keys
+}
+
+fn relocate_cargo_bin(
+    candidate: &Path,
+    build_dir: Option<&Path>,
+    target_dir: Option<&Path>,
+) -> Result<PathBuf, &'static str> {
+    let Some(build_dir) = build_dir else {
+        return Ok(candidate.to_path_buf());
+    };
+    let Some(target_dir) = target_dir else {
+        return Err("separate Cargo build-dir lookup requires CARGO_TARGET_DIR");
+    };
+    if !build_dir.is_absolute() || !target_dir.is_absolute() {
+        return Err("Cargo build and target roots must be absolute for binary lookup");
+    }
+    if build_dir
+        .components()
+        .chain(target_dir.components())
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("Cargo build and target roots must not contain parent traversal");
+    }
+    let suffix = candidate.strip_prefix(build_dir).map_err(
+        |_| "Cargo fallback binary is outside the declared build root; check remapped roots",
+    )?;
+    let parts: Vec<_> = suffix.components().collect();
+    if !matches!(parts.len(), 2 | 3)
+        || parts
+            .iter()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(
+            "unsupported Cargo binary layout; expected profile/name or target/profile/name",
+        );
+    }
+    Ok(target_dir.join(suffix))
 }
 
 pub fn runfiles_available() -> bool {
@@ -97,11 +140,11 @@ fn resolve_bin_from_env(key: &str, value: OsString) -> Result<PathBuf, CargoBinE
                     .map_err(|source| CargoBinError::CurrentDir { source })?
                     .join(resolved);
             }
-            if resolved.exists() {
+            if resolved.is_file() {
                 return Ok(resolved);
             }
         }
-    } else if raw.is_absolute() && raw.exists() {
+    } else if raw.is_absolute() && raw.is_file() {
         return Ok(raw);
     }
 
@@ -229,3 +272,7 @@ fn normalize_runfile_path(path: &Path) -> PathBuf {
             acc
         })
 }
+
+#[cfg(test)]
+#[path = "cargo_bin_tests.rs"]
+mod tests;

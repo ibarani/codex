@@ -24,3 +24,18 @@ let request = ApplyGitRequest {
 };
 let result = apply_git_patch(&request)?;
 ```
+
+`run_git_command_with_cancellation` accepts an optional command deadline and a
+cancellation future. It drains stdout and stderr concurrently before waiting for
+exit, so a descendant that retains a pipe cannot leave a cached process-group
+identity armed after the root is reaped. Cancellation is checked before spawning.
+Cancellation, timeout and I/O failure request termination using the retained
+child, with a separate two-second allowance to confirm the direct child's exit.
+An absent command deadline leaves duration uncapped; cancellation still applies.
+A dropped future requests the same owned termination; it cannot await cleanup.
+The existing internal timeout API uses this owner and keeps its `Option<Output>`
+contract for Git information queries. Successful output/status semantics and
+Windows contained-job/fallback behavior are retained. The owner does not claim
+to contain descendants that deliberately leave its Unix process group, or to
+confirm every descendant exit. Windows and non-Linux execution require their
+own qualification.

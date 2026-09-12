@@ -1,6 +1,5 @@
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tempfile::TempDir;
 
 use crate::model::AgentMessageMetadata;
 use crate::model::ConversationBody;
@@ -19,13 +18,14 @@ use crate::reducer::test_support::append_inference_start;
 use crate::reducer::test_support::create_started_writer;
 use crate::reducer::test_support::expect_replay_error;
 use crate::reducer::test_support::message;
+use crate::reducer::test_support::private_tempdir;
 use crate::reducer::test_support::start_turn;
 use crate::reducer::test_support::trace_context;
 use crate::replay_bundle;
 
 #[test]
 fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -69,7 +69,7 @@ fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> any
 
 #[test]
 fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -112,7 +112,7 @@ fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<
 
 #[test]
 fn agent_messages_preserve_routing_and_content() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -196,7 +196,7 @@ fn agent_messages_preserve_routing_and_content() -> anyhow::Result<()> {
 
 #[test]
 fn later_full_request_reuses_prior_json_tool_call_by_position() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -257,7 +257,7 @@ fn later_full_request_reuses_prior_json_tool_call_by_position() -> anyhow::Resul
 
 #[test]
 fn request_reuses_prior_tool_search_call_with_internal_metadata() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -330,7 +330,7 @@ fn request_reuses_prior_tool_search_call_with_internal_metadata() -> anyhow::Res
 #[test]
 fn request_reuses_prior_tool_outputs_with_internal_metadata() -> anyhow::Result<()> {
     for item_type in ["tool_search_output", "mcp_tool_call_output"] {
-        let temp = TempDir::new()?;
+        let temp = private_tempdir()?;
         let writer = create_started_writer(&temp)?;
         start_turn(&writer, "turn-1")?;
 
@@ -389,7 +389,7 @@ fn request_reuses_prior_tool_outputs_with_internal_metadata() -> anyhow::Result<
 #[test]
 fn tool_output_call_id_reuse_with_different_nested_metadata_is_reducer_error() -> anyhow::Result<()>
 {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -431,15 +431,12 @@ fn tool_output_call_id_reuse_with_different_nested_metadata_is_reducer_error() -
     )?;
     append_inference_start(&writer, "inference-2", "turn-2", conflicting_request)?;
 
-    expect_replay_error(
-        &temp,
-        "model-visible call id call-search was reused with different content",
-    )
+    expect_replay_error(&temp, "trace semantic reduction failed at event ordinal 5")
 }
 
 #[test]
 fn incremental_request_carries_prior_request_and_response_items_forward() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -526,7 +523,7 @@ fn incremental_request_carries_prior_request_and_response_items_forward() -> any
 
 #[test]
 fn full_request_snapshot_can_reorder_existing_items_and_insert_summary() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -569,7 +566,7 @@ fn full_request_snapshot_can_reorder_existing_items_and_insert_summary() -> anyh
 
 #[test]
 fn reasoning_body_preserves_text_summary_and_encoded_content() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -619,7 +616,7 @@ fn reasoning_body_preserves_text_summary_and_encoded_content() -> anyhow::Result
 
 #[test]
 fn encrypted_reasoning_reuses_response_item_in_later_request() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -719,7 +716,7 @@ fn encrypted_reasoning_reuses_response_item_in_later_request() -> anyhow::Result
 
 #[test]
 fn encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -786,7 +783,7 @@ fn encrypted_reasoning_upgrades_when_later_sighting_has_more_readable_body() -> 
 
 #[test]
 fn same_encrypted_reasoning_with_different_text_reuses_first_readable_body() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -863,7 +860,7 @@ fn same_encrypted_reasoning_with_different_text_reuses_first_readable_body() -> 
 
 #[test]
 fn model_visible_call_id_reuse_with_different_content_is_reducer_error() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -894,15 +891,12 @@ fn model_visible_call_id_reuse_with_different_content_is_reducer_error() -> anyh
     )?;
     append_inference_start(&writer, "inference-2", "turn-2", conflicting_request)?;
 
-    expect_replay_error(
-        &temp,
-        "model-visible call id call-1 was reused with different content",
-    )
+    expect_replay_error(&temp, "trace semantic reduction failed at event ordinal 5")
 }
 
 #[test]
 fn unsupported_model_item_is_reducer_error() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -919,15 +913,12 @@ fn unsupported_model_item_is_reducer_error() -> anyhow::Result<()> {
     )?;
     append_inference_start(&writer, "inference-1", "turn-1", request)?;
 
-    expect_replay_error(
-        &temp,
-        "unsupported model item type new_unhandled_model_item",
-    )
+    expect_replay_error(&temp, "trace semantic reduction failed at event ordinal 3")
 }
 
 #[test]
 fn additional_tools_are_excluded_from_request_conversation() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -969,7 +960,7 @@ fn additional_tools_are_excluded_from_request_conversation() -> anyhow::Result<(
 
 #[test]
 fn missing_request_input_is_reducer_error() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -981,12 +972,12 @@ fn missing_request_input_is_reducer_error() -> anyhow::Result<()> {
     )?;
     append_inference_start(&writer, "inference-1", "turn-1", request)?;
 
-    expect_replay_error(&temp, "did not contain input")
+    expect_replay_error(&temp, "trace semantic reduction failed at event ordinal 3")
 }
 
 #[test]
 fn unknown_previous_response_id_is_reducer_error() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -999,12 +990,12 @@ fn unknown_previous_response_id_is_reducer_error() -> anyhow::Result<()> {
     )?;
     append_inference_start(&writer, "inference-1", "turn-1", request)?;
 
-    expect_replay_error(&temp, "unknown previous_response_id resp-missing")
+    expect_replay_error(&temp, "trace semantic reduction failed at event ordinal 3")
 }
 
 #[test]
 fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -1107,7 +1098,7 @@ fn compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::
 
 #[test]
 fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -1176,7 +1167,7 @@ fn context_compaction_boundary_repeats_prefix_and_reuses_replacement_items() -> 
 
 #[test]
 fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
 
@@ -1273,7 +1264,7 @@ fn tool_call_links_model_call_and_followup_output_items() -> anyhow::Result<()> 
 
 #[test]
 fn inference_start_rejects_unknown_codex_turn() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let writer = create_started_writer(&temp)?;
 
     let request = writer.write_json_payload(
@@ -1284,5 +1275,5 @@ fn inference_start_rejects_unknown_codex_turn() -> anyhow::Result<()> {
     )?;
     append_inference_start(&writer, "inference-1", "turn-missing", request)?;
 
-    expect_replay_error(&temp, "referenced unknown codex turn turn-missing")
+    expect_replay_error(&temp, "trace semantic reduction failed at event ordinal 2")
 }

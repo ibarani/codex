@@ -1,3 +1,4 @@
+use crate::background_tasks::PluginCancellation;
 mod activation;
 mod git;
 
@@ -20,12 +21,9 @@ use codex_plugin::validate_plugin_segment;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Reloads configuration with the initiating operation's settings. Called only on a blocking worker.
 pub type ConfigLayerReload = Arc<dyn Fn() -> std::io::Result<ConfigLayerStack> + Send + Sync>;
-
-const MARKETPLACE_UPGRADE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredMarketplaceUpgradeError {
@@ -93,6 +91,24 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     mode: PluginGitMode,
     reload_config: &ConfigLayerReload,
 ) -> ConfiguredMarketplaceUpgradeOutcome {
+    upgrade_configured_git_marketplaces_cancellable(
+        codex_home,
+        config_layer_stack,
+        marketplace_name,
+        mode,
+        reload_config,
+        &PluginCancellation::default(),
+    )
+}
+
+pub(crate) fn upgrade_configured_git_marketplaces_cancellable(
+    codex_home: &Path,
+    config_layer_stack: &ConfigLayerStack,
+    marketplace_name: Option<&str>,
+    mode: PluginGitMode,
+    reload_config: &ConfigLayerReload,
+    cancellation: &PluginCancellation,
+) -> ConfiguredMarketplaceUpgradeOutcome {
     let loaded = load_configured_git_marketplaces(config_layer_stack);
     let marketplaces = loaded
         .marketplaces
@@ -119,6 +135,13 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     let mut upgraded_roots = Vec::new();
     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
     for marketplace in marketplaces {
+        if let Err(message) = cancellation.check() {
+            errors.push(ConfiguredMarketplaceUpgradeError {
+                marketplace_name: marketplace.name,
+                message,
+            });
+            break;
+        }
         let normalized_source =
             match validate_marketplace_name_for_add(/*expected_name*/ None, &marketplace.name)
                 .and_then(|()| {
@@ -140,6 +163,7 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
             reload_config,
             normalized_source.as_ref(),
             mode,
+            cancellation,
         ) {
             Ok(Some(upgraded_root)) => upgraded_roots.push(upgraded_root),
             Ok(None) => {}
@@ -229,6 +253,7 @@ fn upgrade_configured_git_marketplace(
     reload_config: &ConfigLayerReload,
     normalized_source: Option<&MarketplaceSource>,
     mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<Option<AbsolutePathBuf>, String> {
     validate_plugin_segment(&marketplace.name, "marketplace name")?;
     let (source, ref_name) = match normalized_source {
@@ -238,13 +263,7 @@ fn upgrade_configured_git_marketplace(
         }
         None => (marketplace.source.as_str(), marketplace.ref_name.as_deref()),
     };
-    let remote_revision = git_remote_revision(
-        codex_home,
-        source,
-        ref_name,
-        MARKETPLACE_UPGRADE_GIT_TIMEOUT,
-        mode,
-    )?;
+    let remote_revision = git_remote_revision(codex_home, source, ref_name, mode, cancellation)?;
     let destination = install_root.join(&marketplace.name);
     let previous_snapshot = read_installed_marketplace_snapshot(&destination, &marketplace.name);
     if validate_marketplace_root(&destination)
@@ -277,8 +296,8 @@ fn upgrade_configured_git_marketplace(
         ref_name,
         &marketplace.sparse_paths,
         staged_dir.path(),
-        MARKETPLACE_UPGRADE_GIT_TIMEOUT,
         mode,
+        cancellation,
     )?;
     let marketplace_name = validate_marketplace_root(staged_dir.path())
         .map_err(|err| format!("failed to validate upgraded marketplace root: {err}"))?;
@@ -289,6 +308,7 @@ fn upgrade_configured_git_marketplace(
         ));
     }
     write_installed_marketplace_metadata(staged_dir.path(), marketplace, &activated_revision)?;
+    cancellation.check()?;
     activate_marketplace_root(&destination, staged_dir, &previous_snapshot, || {
         ensure_configured_git_marketplace_unchanged(reload_config, marketplace)
     })?;

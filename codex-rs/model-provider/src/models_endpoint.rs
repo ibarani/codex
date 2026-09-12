@@ -20,6 +20,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::collect_auth_env_telemetry;
 use codex_login::default_client::create_client_for_route_async;
+use codex_model_provider_info::ModelDiscovery;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
@@ -126,6 +127,10 @@ impl OpenAiModelsEndpoint {
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn remote_models_enabled(&self) -> bool {
+        self.provider_info.model_discovery != ModelDiscovery::Disabled
+    }
+
     fn has_command_auth(&self) -> bool {
         self.provider_info.has_command_auth()
     }
@@ -354,6 +359,20 @@ mod tests {
         );
 
         assert!(!endpoint.has_command_auth());
+    }
+
+    #[test]
+    fn discovery_policy_is_independent_of_command_auth() {
+        for (mode, enabled) in [
+            (ModelDiscovery::Auto, true),
+            (ModelDiscovery::Disabled, false),
+        ] {
+            let mut info = provider_info_with_command_auth();
+            info.model_discovery = mode;
+            let endpoint = OpenAiModelsEndpoint::new(info, /*auth_manager*/ None);
+            assert_eq!(endpoint.remote_models_enabled(), enabled);
+            assert!(endpoint.has_command_auth());
+        }
     }
 
     #[tokio::test]

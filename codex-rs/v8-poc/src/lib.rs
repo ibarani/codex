@@ -13,6 +13,10 @@ pub fn embedded_v8_version() -> &'static str {
 }
 
 /// Returns whether the linked V8 library was built with the in-process sandbox.
+///
+/// Cargo can enable the dependency's sandbox through another workspace crate even when this
+/// crate's optional `sandbox` feature is disabled. Enabling the local feature requires it;
+/// disabling the local feature does not require a sandbox-free dependency.
 #[must_use]
 pub fn linked_v8_has_sandbox() -> bool {
     unsafe extern "C" {
@@ -65,8 +69,12 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_feature_matches_linked_v8() {
-        assert_eq!(super::linked_v8_has_sandbox(), cfg!(feature = "sandbox"));
+    fn requested_sandbox_feature_is_enabled_in_linked_v8() {
+        let linked_has_sandbox = super::linked_v8_has_sandbox();
+        assert!(
+            !cfg!(feature = "sandbox") || linked_has_sandbox,
+            "the requested sandbox feature must be present in the linked V8 library"
+        );
     }
 
     #[test]

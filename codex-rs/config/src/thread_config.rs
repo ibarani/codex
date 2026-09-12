@@ -282,6 +282,7 @@ mod tests {
                     name = "local"
                     base_url = "http://127.0.0.1:8061/api/codex"
                     wire_api = "responses"
+                    model_discovery = "auto"
                     requires_openai_auth = false
                     supports_websockets = true
                     supports_standalone_web_search = true
@@ -296,6 +297,7 @@ mod tests {
 
     fn test_provider(name: &str) -> ModelProviderInfo {
         ModelProviderInfo {
+            model_discovery: Default::default(),
             name: name.to_string(),
             base_url: Some("http://127.0.0.1:8061/api/codex".to_string()),
             env_key: None,

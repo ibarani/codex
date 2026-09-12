@@ -572,14 +572,14 @@ fn pruning_protects_recent_processes_even_if_exited() {
 #[tokio::test]
 async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing() {
     let (_, turn) = crate::session::tests::make_session_and_context().await;
-    let exited_process = Arc::new(
-        crate::unified_exec::process_tests::remote_process(
-            codex_exec_server::WriteStatus::Accepted,
-            /*terminate_error*/ None,
-            codex_sandboxing::SandboxType::None,
-        )
-        .await,
-    );
+    let crate::unified_exec::process_tests::ControlledProcess {
+        process: exited_process,
+        stdout,
+        exit,
+        ..
+    } = crate::unified_exec::process_tests::controlled_process().await;
+    exit.send(0).expect("deliver actual exit");
+    drop(stdout);
     exited_process
         .terminate_confirmed()
         .await
@@ -642,4 +642,128 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         (pruned.map(|entry| entry.process_id), store.processes.len()),
         (None, MAX_UNIFIED_EXEC_PROCESSES)
     );
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_all_processes_with_concurrent_confirmation_deadlines() {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
+    let first = crate::unified_exec::process_tests::controlled_process().await;
+    let second = crate::unified_exec::process_tests::controlled_process().await;
+    let crate::unified_exec::process_tests::ControlledProcess {
+        process: completing,
+        stdout,
+        exit,
+        termination_requests: completing_requests,
+    } = crate::unified_exec::process_tests::controlled_process().await;
+    let unavailable = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            Some("synthetic shutdown transport unavailable".to_string()),
+            codex_sandboxing::SandboxType::None,
+        )
+        .await,
+    );
+    let manager = UnifiedExecProcessManager::default();
+    let cwd = turn
+        .environments
+        .primary()
+        .expect("turn environment")
+        .cwd()
+        .clone();
+    {
+        let mut store = manager.process_store.lock().await;
+        for (process_id, process) in [
+            (1, Arc::clone(&first.process)),
+            (2, Arc::clone(&second.process)),
+            (3, Arc::clone(&completing)),
+            (4, Arc::clone(&unavailable)),
+        ] {
+            store.reserved_process_ids.insert(process_id);
+            store.processes.insert(
+                process_id,
+                ProcessEntry {
+                    process,
+                    plugin_metrics_sidecar: None,
+                    call_id: format!("shutdown-{process_id}"),
+                    process_id,
+                    cwd: cwd.clone(),
+                    initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+                    hook_command: "synthetic shutdown control".to_string(),
+                    tty: false,
+                    environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+                    permissions: super::super::TerminalPermissions::for_launch(
+                        turn.environments.primary().expect("turn environment"),
+                        &turn,
+                        super::super::TerminalSandboxSource::Native,
+                        crate::sandboxing::SandboxPermissions::UseDefault,
+                        /*additional_permissions*/ None,
+                        /*internal_permissions*/ None,
+                    ),
+                    network_approval: None,
+                    session: std::sync::Weak::new(),
+                    last_used: Instant::now(),
+                },
+            );
+        }
+    }
+    unavailable.fail_and_terminate("synthetic failed-state control".to_string());
+    assert!(unavailable.has_exited());
+    assert!(
+        !manager.terminate_process(/*process_id*/ 4).await,
+        "a failed state cannot bypass exit confirmation"
+    );
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&4)
+    );
+    tokio::time::pause();
+    let started = Instant::now();
+    let mut shutdown = Box::pin(manager.terminate_all_processes());
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    assert_eq!(first.termination_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(second.termination_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(completing_requests.load(Ordering::SeqCst), 1);
+    exit.send(137).expect("deliver exit for completing process");
+    stdout
+        .send(b"shutdown tail".to_vec())
+        .expect("deliver trailing output");
+    drop(stdout);
+    shutdown.await;
+    // Tokio rounds deadlines up to the next millisecond tick.
+    assert!(
+        (Duration::from_secs(5)..=Duration::from_millis(5_001)).contains(&started.elapsed()),
+        "unavailable peers share one deadline interval"
+    );
+    assert_eq!(
+        first.process.exit_code(),
+        None,
+        "timeout must not invent an exit"
+    );
+    assert_eq!(
+        second.process.exit_code(),
+        None,
+        "timeout must not invent an exit"
+    );
+    assert_eq!(completing.exit_code(), Some(137));
+    assert_eq!(
+        unavailable.exit_code(),
+        None,
+        "failed termination must not invent an exit"
+    );
+    assert_eq!(
+        completing
+            .output_handles()
+            .output_buffer
+            .lock()
+            .await
+            .to_bytes(),
+        b"shutdown tail"
+    );
+    let store = manager.process_store.lock().await;
+    assert!(store.processes.is_empty());
+    assert!(store.reserved_process_ids.is_empty());
 }

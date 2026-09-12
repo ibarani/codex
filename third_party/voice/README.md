@@ -57,14 +57,38 @@ It contains headers (including the target's GLib configuration), development
 library names, import/static libraries and pkg-config metadata. `sdk.json`
 records the target, source commit, pinned manifest and every exported file hash.
 Shared-library bytes must match the native inspection receipt; other development
-files are hashed during export. This is provenance, not an authenticity check.
+files are hashed during export. Rewritten pkg-config records also retain their
+original `sourceSha256`. This is provenance, not an authenticity check.
 
 Meson generates relocatable pkg-config metadata using its standard option.
-Consumers must restrict `PKG_CONFIG_LIBDIR` to the SDK, clear `PKG_CONFIG_PATH`,
-and use `pkg-config --define-prefix` for libffi/PCRE2/zlib metadata too. Only the
-required native metadata is exported; capture Opus uses `opusic-sys`. Native
-library loader paths are not changed by SDK export. These build inputs do not replace the
-separate runtime projection and are never copied into users' Codex packages.
+SDK export rebases libffi/PCRE2/zlib's declared prefix and absolute variable
+assignments inside it to pkg-config-relative references, preserving package
+versions and flags. This includes CMake's independent absolute `exec_prefix`,
+which `--define-prefix` alone does not relocate. Ambiguous prefixes, foreign
+absolute variable paths and remaining literal build-prefix references fail
+export and remove the incomplete output.
+
+For an isolated relocated-SDK check, restrict `PKG_CONFIG_LIBDIR` to the SDK,
+clear `PKG_CONFIG_PATH`, and use `pkg-config --define-prefix`. This checks that
+the exported development inputs resolve without unrelated host metadata.
+
+For a mixed Cargo build using the genuine original native installation prefixes
+and system dependencies, use native `pkg-config` without forcing prefix rewriting.
+Keep `PKG_CONFIG_PATH` empty and prepend the private native and ALSA metadata
+directories to the verified default search path from
+`pkg-config --variable=pc_path pkg-config` in `PKG_CONFIG_LIBDIR`. This preserves
+private-library precedence and discovery of existing system dependencies such
+as OpenSSL. A global `--define-prefix` wrapper can misinterpret system multiarch
+metadata and emit nonexistent include/library paths. Check each selected `.pc`
+file, its required version, and every emitted `-I`/`-L` directory. Include
+`PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1` and `PKG_CONFIG_ALLOW_SYSTEM_LIBS=1` in those
+checks so normally filtered system paths are also validated. The original
+installation prefixes must remain present throughout the build.
+
+Only the required native metadata is exported; capture Opus uses `opusic-sys`.
+Native library loader paths are not changed by SDK export. These build inputs
+do not replace the separate runtime projection and are never copied into users'
+Codex packages.
 Final helper linkage and moved-package execution remain separate integration
 work; exporting an SDK does not enable voice.
 

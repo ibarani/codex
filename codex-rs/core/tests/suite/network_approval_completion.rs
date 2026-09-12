@@ -1,4 +1,5 @@
 //! Exercises process cleanup while a remote network review is still pending.
+//! The fake executor remains available until the session confirms its shutdown.
 
 use super::PushedExecScenario;
 use super::accept_initialized_exec_server;
@@ -15,6 +16,7 @@ use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::managed_network_requirements_loader;
@@ -36,6 +38,7 @@ use std::fs;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 
@@ -85,6 +88,7 @@ async fn completed_remote_process_withdraws_pending_network_review() -> Result<(
         ]),
     )
     .await;
+    let (shutdown_complete_tx, mut shutdown_complete_rx) = oneshot::channel();
     let exec_server = tokio::spawn(async move {
         let mut websocket = accept_initialized_exec_server(listener).await;
         let start = loop {
@@ -134,8 +138,15 @@ async fn completed_remote_process_withdraws_pending_network_review() -> Result<(
             send_exec_server_json(&mut websocket, message).await;
         }
         loop {
-            let request =
-                read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 10)).await;
+            let request = tokio::select! {
+                // Keep checking requests until the real session shutdown completes.
+                biased;
+                request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 10)) => request,
+                shutdown = &mut shutdown_complete_rx => {
+                    shutdown.expect("test must observe ShutdownComplete before stopping the executor");
+                    break;
+                }
+            };
             match request["method"].as_str() {
                 Some("process/terminate") => {
                     send_exec_server_json(
@@ -143,7 +154,7 @@ async fn completed_remote_process_withdraws_pending_network_review() -> Result<(
                         json!({"id": request["id"], "result": {"running": false}}),
                     )
                     .await;
-                    break;
+                    // Closure may still be in flight when the client requests cleanup.
                 }
                 Some("process/read") => {
                     send_exec_server_json(&mut websocket, json!({"id": request["id"], "result": {"chunks": [], "nextSeq": 4, "exited": true, "exitCode": 0, "closed": true, "failure": null, "sandboxDenied": false}})).await;
@@ -237,6 +248,22 @@ allow_local_binding = true
     assert!(output.contains("Process exited with code 0"), "{output}");
     assert!(output.contains("build complete"), "{output}");
     assert_eq!(parent.requests().len(), 1);
+    test.codex.submit(Op::Shutdown).await?;
+    timeout(Duration::from_secs(/*secs*/ 10), async {
+        loop {
+            if matches!(
+                test.codex.next_event().await?.msg,
+                EventMsg::ShutdownComplete
+            ) {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await
+    .context("session must finish shutdown while the executor remains available")??;
+    shutdown_complete_tx
+        .send(())
+        .expect("fake executor must remain available until session shutdown completes");
     timeout(Duration::from_secs(/*secs*/ 10), exec_server).await??;
     Ok(())
 }

@@ -35,6 +35,11 @@ const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 /// manager owns refresh policy, cache behavior, and catalog merging; it calls
 /// this endpoint only when it decides a remote refresh should happen.
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
+    /// Whether this provider permits remote metadata discovery and cache access.
+    fn remote_models_enabled(&self) -> bool {
+        true
+    }
+
     /// Returns whether this provider can authenticate command-scoped requests.
     fn has_command_auth(&self) -> bool;
 
@@ -354,6 +359,9 @@ impl OpenAiModelsManager {
     }
 
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
+        if !self.endpoint_client.remote_models_enabled() {
+            return;
+        }
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
             if let Some(cache) = self.cache.as_ref()
@@ -377,6 +385,9 @@ impl OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        if !self.endpoint_client.remote_models_enabled() {
+            return Ok(());
+        }
         if !self.should_refresh_models().await {
             if matches!(
                 refresh_strategy,
@@ -474,7 +485,7 @@ impl OpenAiModelsManager {
         *self.remote_models.write().await = existing_models;
     }
 
-    /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+    /// Attempt to satisfy the refresh from a fresh cache entry for this client version.
     async fn try_load_cache(&self) -> bool {
         let Some(cache) = self.cache.as_ref() else {
             return false;

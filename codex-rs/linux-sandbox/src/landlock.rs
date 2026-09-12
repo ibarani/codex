@@ -3,6 +3,11 @@
 //! Filesystem restrictions are enforced by bubblewrap in `linux_run_main`.
 //! Landlock helpers remain available here as legacy/backup utilities.
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Seek;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::path::Path;
 
 use codex_protocol::error::CodexErr;
@@ -65,7 +70,7 @@ pub(crate) fn apply_permission_profile_to_current_thread(
     }
 
     if let Some(mode) = network_seccomp_mode {
-        install_network_seccomp_filter_on_current_thread(mode)?;
+        apply_filter(&build_network_seccomp_filter(mode)?).map_err(SandboxErr::from)?;
     }
 
     if apply_landlock_fs && !file_system_sandbox_policy.has_full_disk_write_access() {
@@ -88,7 +93,7 @@ pub(crate) fn apply_permission_profile_to_current_thread(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetworkSeccompMode {
+pub(crate) enum NetworkSeccompMode {
     Restricted,
     ProxyRouted,
 }
@@ -162,13 +167,47 @@ fn install_filesystem_landlock_rules_on_current_thread(
     Ok(())
 }
 
-/// Installs a seccomp filter for Linux network sandboxing.
+/// Export the same network policy for Bubblewrap's init and command processes.
 ///
-/// The filter is applied to the current thread so only the sandboxed child
-/// inherits it.
-fn install_network_seccomp_filter_on_current_thread(
+/// A sealed anonymous file keeps the filter independent of sandboxed path access
+/// and prevents inherited descriptors from modifying the program before loading.
+pub(crate) fn network_seccomp_filter_file(mode: NetworkSeccompMode) -> Result<File> {
+    let program = build_network_seccomp_filter(mode)?;
+    // SAFETY: the static name is NUL-terminated and the flags require no pointers.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"codex-network-seccomp".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: memfd_create returned a new descriptor, transferred once to File.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    for instruction in program {
+        file.write_all(&instruction.code.to_ne_bytes())?;
+        file.write_all(&[instruction.jt, instruction.jf])?;
+        file.write_all(&instruction.k.to_ne_bytes())?;
+    }
+    file.rewind()?;
+    // SAFETY: F_ADD_SEALS accepts integer flags and File owns the live descriptor.
+    if unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(file)
+}
+
+fn build_network_seccomp_filter(
     mode: NetworkSeccompMode,
-) -> std::result::Result<(), SandboxErr> {
+) -> std::result::Result<BpfProgram, SandboxErr> {
     fn deny_syscall(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, nr: i64) {
         rules.insert(nr, vec![]); // empty rule vec = unconditional match
     }
@@ -260,11 +299,7 @@ fn install_network_seccomp_filter_on_current_thread(
         },
     )?;
 
-    let prog: BpfProgram = filter.try_into()?;
-
-    apply_filter(&prog)?;
-
-    Ok(())
+    Ok(filter.try_into()?)
 }
 
 #[cfg(test)]
@@ -345,3 +380,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "seccomp_filter_file_tests.rs"]
+mod seccomp_filter_file_tests;

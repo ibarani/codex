@@ -17,6 +17,20 @@ use crate::writer::TraceWriter;
 pub(crate) const ROOT_THREAD_ID: &str = "thread-root";
 pub(crate) const AGENT_ROOT_THREAD_ID: &str = "019d0000-0000-7000-8000-000000000001";
 
+/// Creates a private fixture directory without relying on the runner's umask.
+pub(crate) fn private_tempdir() -> std::io::Result<TempDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
+    #[cfg(not(unix))]
+    tempfile::Builder::new().tempdir()
+}
+
 pub(crate) fn message(role: &str, text: &str) -> serde_json::Value {
     json!({
         "type": "message",
@@ -194,9 +208,9 @@ pub(crate) fn append_completed_inference(
 
 pub(crate) fn expect_replay_error(temp: &TempDir, expected: &str) -> anyhow::Result<()> {
     let Err(err) = replay_bundle(temp.path()) else {
-        panic!("expected replay error containing {expected}");
+        panic!("expected replay error {expected}");
     };
-    let message = err.to_string();
-    assert!(message.contains(expected), "unexpected error: {message}");
+    let message = format!("{err:#}");
+    pretty_assertions::assert_eq!(message, expected);
     Ok(())
 }

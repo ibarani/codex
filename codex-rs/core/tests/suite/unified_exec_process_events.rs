@@ -1,3 +1,6 @@
+//! Exercises pushed process events until the caller observes terminal tool output.
+//! A completed remote process need not receive a redundant termination request.
+
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
@@ -48,6 +51,7 @@ use std::time::Duration;
 use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
@@ -185,6 +189,7 @@ async fn respond_environment_info(
 async fn serve_exec_with_pushed_events(
     listener: TcpListener,
     scenario: PushedExecScenario,
+    mut observed_output: oneshot::Receiver<()>,
 ) -> PushedExecServerResult {
     let unrestricted_patch = matches!(
         scenario,
@@ -448,7 +453,22 @@ async fn serve_exec_with_pushed_events(
 
     let mut process_read_requests = 0;
     loop {
-        let request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
+        let request = tokio::select! {
+            // Service queued reads before acknowledging the test's observation.
+            biased;
+            request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)) => request,
+            observed = &mut observed_output => {
+                observed.expect("test must observe terminal output before stopping the executor");
+                assert!(
+                    !matches!(scenario, PushedExecScenario::DirectDenied),
+                    "direct denial must terminate the executor process"
+                );
+                return PushedExecServerResult {
+                    process_read_requests,
+                    process_start,
+                };
+            }
+        };
         match request["method"].as_str() {
             Some("process/read") => {
                 process_read_requests += 1;
@@ -552,10 +572,14 @@ async fn serve_exec_with_pushed_events(
                     }),
                 )
                 .await;
-                return PushedExecServerResult {
-                    process_read_requests,
-                    process_start,
-                };
+                if matches!(scenario, PushedExecScenario::DirectDenied) {
+                    return PushedExecServerResult {
+                        process_read_requests,
+                        process_start,
+                    };
+                }
+                // The client can observe exit before consuming the closed event.
+                // Respond to that idempotent cleanup without requiring it to occur.
             }
             method => panic!("unexpected exec-server request: {method:?}"),
         }
@@ -642,7 +666,12 @@ async fn exec_command_consumes_pushed_remote_process_events(
     )
     .await;
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
-    let exec_server = tokio::spawn(serve_exec_with_pushed_events(listener, scenario));
+    let (observed_output_tx, observed_output_rx) = oneshot::channel();
+    let exec_server = tokio::spawn(serve_exec_with_pushed_events(
+        listener,
+        scenario,
+        observed_output_rx,
+    ));
     let mut builder = test_codex().with_exec_server_url(exec_server_url);
     if managed_network_configured {
         let cloud_config_bundle = match managed_network {
@@ -961,6 +990,35 @@ timeout = 900
         );
         return Ok(());
     }
+    if managed_network_enabled {
+        timeout(Duration::from_secs(/*secs*/ 5), async {
+            while response_mock.requests().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(/*millis*/ 10)).await;
+            }
+        })
+        .await
+        .context("model should receive the remote exec output")?;
+    }
+    let request = response_mock
+        .last_request()
+        .context("model should receive the exec_command output")?;
+    let (output, success) = request
+        .function_call_output_content_and_success(CALL_ID)
+        .context("exec_command output should be model visible")?;
+    let output = output.context("exec_command output should contain text")?;
+    if matches!(
+        scenario,
+        PushedExecScenario::DirectDenied | PushedExecScenario::LegacyExit
+    ) {
+        assert!(output.contains("Process exited with code 1"));
+    } else {
+        assert!(output.contains("Process exited with code 0"));
+    }
+    if !matches!(scenario, PushedExecScenario::DirectDenied) {
+        observed_output_tx
+            .send(())
+            .expect("fake exec-server must remain available until terminal output is observed");
+    }
     let cleanup_timeout = if managed_network_enabled {
         Duration::from_secs(15)
     } else {
@@ -968,7 +1026,7 @@ timeout = 900
     };
     let exec_server_result = timeout(cleanup_timeout, exec_server)
         .await
-        .context("fake exec-server should observe process cleanup")??;
+        .context("fake exec-server should finish after observed terminal output")??;
     assert_eq!(
         exec_server_result.process_start["params"]["metadata"],
         json!({
@@ -1009,13 +1067,8 @@ timeout = 900
         );
         assert_eq!(params["networkProxy"]["environmentId"], "remote");
         assert!(params["networkProxy"]["executionId"].as_str().is_some());
-        timeout(Duration::from_secs(5), async {
-            while response_mock.requests().len() < 2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .context("model should receive the remote exec output")?;
+        assert_ne!(success, Some(false));
+        assert!(output.contains(COMPLETE_OUTPUT));
         return Ok(());
     }
     if matches!(managed_network, ManagedNetworkScenario::Disabled) {
@@ -1025,19 +1078,11 @@ timeout = 900
         assert_eq!(params["networkProxy"], Value::Null);
         assert_eq!(params["env"]["HTTP_PROXY"], Value::Null);
     }
-    let request = response_mock
-        .last_request()
-        .context("model should receive the exec_command output")?;
-    let (output, success) = request
-        .function_call_output_content_and_success(CALL_ID)
-        .context("exec_command output should be model visible")?;
-    let output = output.context("exec_command output should contain text")?;
     let process_read_requests = exec_server_result.process_read_requests;
     match scenario {
         PushedExecScenario::Complete | PushedExecScenario::ElevatedPowerShell => {
             assert_ne!(success, Some(false));
             assert!(saw_exec_command_begin);
-            assert!(output.contains("Process exited with code 0"));
             assert!(output.contains(COMPLETE_OUTPUT));
             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
         }
@@ -1046,7 +1091,6 @@ timeout = 900
         }
         PushedExecScenario::DirectDenied => {
             assert!(!saw_exec_command_begin);
-            assert!(output.contains("Process exited with code 1"));
             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
         }
         PushedExecScenario::SandboxedInterceptedPatch
@@ -1061,7 +1105,6 @@ timeout = 900
         }
         PushedExecScenario::LegacyExit => {
             assert!(!saw_exec_command_begin);
-            assert!(output.contains("Process exited with code 1"));
             assert_eq!(process_read_requests, 1, "expected compatibility read");
         }
         PushedExecScenario::ReplayGap => {

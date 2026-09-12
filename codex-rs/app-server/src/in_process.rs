@@ -1040,3 +1040,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "in_process_plugin_lifetime_tests.rs"]
+mod plugin_lifetime_tests;

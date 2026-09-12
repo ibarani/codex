@@ -1,27 +1,22 @@
 //! Deterministic replay from raw trace events to `RolloutTrace`.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::BufRead;
-use std::io::BufReader;
 use std::path::Path;
-use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::bail;
 use serde_json::Value;
 
-use crate::bundle::MANIFEST_FILE_NAME;
-use crate::bundle::RAW_EVENT_LOG_FILE_NAME;
 use crate::bundle::REDUCED_TRACE_SCHEMA_VERSION;
-use crate::bundle::TraceBundleManifest;
 use crate::model::ExecutionStatus;
 use crate::model::RolloutTrace;
 use crate::payload::RawPayloadRef;
 use crate::raw_event::RawTraceEvent;
 use crate::raw_event::RawTraceEventPayload;
 
+mod admission;
 mod code_cell;
 mod compaction;
 mod conversation;
@@ -40,12 +35,49 @@ use self::tool::ObservedAgentResultEdge;
 use self::tool::PendingAgentInteractionEdge;
 use self::tool::ToolCallStarted;
 
-/// Replays a local trace bundle into a reduced rollout graph.
+/// A reduced graph and the exact source bytes admitted for that projection.
+///
+/// Admission validates local storage, schema, event order, identity and every
+/// referenced JSON payload. It does not assert a complete capture or a provider
+/// outcome: missing raw terminal events remain missing even when the diagnostic
+/// reducer closes an inference at turn end. Raw bytes are unredacted private
+/// content and must pass a separate privacy boundary before persistence/export.
+pub struct AdmittedTraceBundle {
+    /// Existing diagnostic projection, including its inferred lifecycle closure.
+    pub rollout: RolloutTrace,
+    /// Original typed events; exact terminal provenance lives here.
+    pub events: Vec<RawTraceEvent>,
+    /// Complete admitted manifest bytes, before parsing or redaction.
+    pub manifest_json: Vec<u8>,
+    /// Complete admitted JSONL bytes, before parsing or redaction.
+    pub event_log_jsonl: Vec<u8>,
+    /// Original bytes for every unique referenced payload, keyed by native ID.
+    pub payloads: BTreeMap<String, Vec<u8>>,
+}
+
+/// Replays a bounded local trace bundle into its diagnostic rollout graph.
+///
+/// Use [`admit_bundle`] when exact source bytes or raw terminal evidence are
+/// needed. Successful replay alone does not establish capture completeness.
 pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
-    let bundle_dir = bundle_dir.as_ref();
-    let manifest: TraceBundleManifest =
-        serde_json::from_reader(File::open(bundle_dir.join(MANIFEST_FILE_NAME))?)
-            .with_context(|| format!("read {}", bundle_dir.join(MANIFEST_FILE_NAME).display()))?;
+    Ok(admit_bundle(bundle_dir)?.rollout)
+}
+
+/// Admits local evidence once, then reduces only that in-memory snapshot.
+///
+/// All referenced files must be regular, nonsymlinked JSON beneath the standard
+/// bundle layout. Unix files have a single link, must be private, and share the directory owner;
+/// Linux additionally checks the current user. Windows ACL qualification is not
+/// implied. Admission is bounded by the producer's record, aggregate and count
+/// limits; partial valid event sequences remain available for diagnosis.
+pub fn admit_bundle(bundle_dir: impl AsRef<Path>) -> Result<AdmittedTraceBundle> {
+    let admission::BundleSnapshot {
+        manifest,
+        manifest_json,
+        event_log_jsonl,
+        events,
+        payloads,
+    } = admission::read_bundle(bundle_dir.as_ref())?;
     let mut reducer = TraceReducer {
         rollout: RolloutTrace::new(
             REDUCED_TRACE_SCHEMA_VERSION,
@@ -54,7 +86,7 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
             manifest.root_thread_id,
             manifest.started_at_unix_ms,
         ),
-        bundle_dir: bundle_dir.to_path_buf(),
+        payloads,
         next_conversation_item_ordinal: 1,
         next_terminal_operation_ordinal: 1,
         thread_conversation_snapshots: BTreeMap::new(),
@@ -65,29 +97,35 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
         pending_agent_interaction_edges: Vec::new(),
     };
 
-    let event_log_path = bundle_dir.join(RAW_EVENT_LOG_FILE_NAME);
-    let event_log = File::open(&event_log_path)
-        .with_context(|| format!("open trace event log {}", event_log_path.display()))?;
-    for (line_index, line) in BufReader::new(event_log).lines().enumerate() {
-        let line = line.with_context(|| format!("read trace event line {}", line_index + 1))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: RawTraceEvent = serde_json::from_str(&line)
-            .with_context(|| format!("parse trace event line {}", line_index + 1))?;
-        reducer.apply_event(event)?;
+    for event in &events {
+        // Domain errors may contain private roles, IDs, or nested serde values.
+        // The ordinal points to local evidence without exporting that content.
+        reducer.apply_event(event.clone()).map_err(|_| {
+            anyhow!(
+                "trace semantic reduction failed at event ordinal {}",
+                event.seq
+            )
+        })?;
     }
     // Spawn edges prefer the child task message as their target, but a child can
     // fail before that message is ever reduced. Only after replaying the whole
     // bundle do we know which spawn deliveries need the child-thread fallback.
-    reducer.resolve_pending_spawn_edge_fallbacks()?;
+    reducer
+        .resolve_pending_spawn_edge_fallbacks()
+        .map_err(|_| anyhow!("trace semantic reduction failed while resolving pending edges"))?;
 
-    Ok(reducer.rollout)
+    Ok(AdmittedTraceBundle {
+        rollout: reducer.rollout,
+        events,
+        manifest_json,
+        event_log_jsonl,
+        payloads: reducer.payloads,
+    })
 }
 
 struct TraceReducer {
     rollout: RolloutTrace,
-    bundle_dir: PathBuf,
+    payloads: BTreeMap<String, Vec<u8>>,
     next_conversation_item_ordinal: u64,
     next_terminal_operation_ordinal: u64,
     /// Last model-visible conversation snapshot per thread.
@@ -139,10 +177,11 @@ impl TraceReducer {
     fn read_payload_json(&self, payload: &RawPayloadRef) -> Result<Value> {
         // Reducers keep raw bodies out of the graph, but typed replay sometimes
         // needs a small subset of fields to build semantic objects.
-        let payload_path = self.bundle_dir.join(&payload.path);
-        let file = File::open(&payload_path)
-            .with_context(|| format!("open payload {}", payload.raw_payload_id))?;
-        serde_json::from_reader(file)
+        let bytes = self
+            .payloads
+            .get(&payload.raw_payload_id)
+            .context("reducer requested a payload outside the admitted snapshot")?;
+        serde_json::from_slice(bytes)
             .with_context(|| format!("parse payload {}", payload.raw_payload_id))
     }
 
@@ -482,6 +521,7 @@ impl TraceReducer {
     fn insert_raw_payload(&mut self, payload: &RawPayloadRef) {
         self.rollout
             .raw_payloads
-            .insert(payload.raw_payload_id.clone(), payload.clone());
+            .entry(payload.raw_payload_id.clone())
+            .or_insert_with(|| payload.clone());
     }
 }

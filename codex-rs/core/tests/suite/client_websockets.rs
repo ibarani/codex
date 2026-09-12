@@ -713,6 +713,16 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
         .await
         .expect("websocket prewarm failed");
 
+    #[cfg(unix)]
+    let trace_dir = {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("trace dir")
+    };
+    #[cfg(not(unix))]
     let trace_dir = TempDir::new().expect("trace dir");
     let writer = Arc::new(
         TraceWriter::create(
@@ -2490,6 +2500,7 @@ fn websocket_provider_with_connect_timeout(
     websocket_connect_timeout_ms: Option<u64>,
 ) -> ModelProviderInfo {
     ModelProviderInfo {
+        model_discovery: Default::default(),
         name: "mock-ws".into(),
         base_url: Some(format!("{}/v1", server.uri())),
         env_key: None,

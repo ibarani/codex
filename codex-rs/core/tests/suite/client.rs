@@ -35,6 +35,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -745,7 +746,7 @@ impl ProviderAuthCommandFixture {
             std::fs::write(
                 &script_path,
                 r#"#!/bin/sh
-if [ -f fail-until-401 ]; then
+if [ -f fail-until-corrected ]; then
     exit 1
 fi
 first_line=$(sed -n '1p' tokens.txt)
@@ -770,7 +771,7 @@ mv tokens.next tokens.txt
                 &script_path,
                 r#"@echo off
 setlocal EnableExtensions DisableDelayedExpansion
-if exist fail-until-401 exit /b 1
+if exist fail-until-corrected exit /b 1
 
 set "first_line="
 <tokens.txt set /p first_line=
@@ -1389,7 +1390,9 @@ async fn provider_auth_command_supplies_bearer_token() {
     .await;
     let auth_fixture = ProviderAuthCommandFixture::new(&["command-token"]).unwrap();
 
-    send_provider_auth_request(&server, auth_fixture.auth()).await;
+    send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1421,28 +1424,20 @@ async fn provider_auth_command_refreshes_after_401() {
         .mount(&server)
         .await;
 
-    send_provider_auth_request(&server, auth_fixture.auth()).await;
+    send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provider_auth_command_recovers_after_initial_resolution_failure() {
+async fn provider_auth_command_rejects_initial_failure_and_accepts_corrected_credentials() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
     let auth_fixture = ProviderAuthCommandFixture::new(&["recovered-token"]).unwrap();
-    let failure_marker = auth_fixture.tempdir.path().join("fail-until-401");
+    let failure_marker = auth_fixture.tempdir.path().join("fail-until-corrected");
     std::fs::write(&failure_marker, "").unwrap();
 
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .and(|request: &wiremock::Request| !request.headers.contains_key("authorization"))
-        .respond_with(move |_request: &wiremock::Request| {
-            std::fs::remove_file(&failure_marker).unwrap();
-            ResponseTemplate::new(401).set_body_string("unauthorized")
-        })
-        .expect(1)
-        .mount(&server)
-        .await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
         .and(header("authorization", "Bearer recovered-token"))
@@ -1458,7 +1453,20 @@ async fn provider_auth_command_recovers_after_initial_resolution_failure() {
         .mount(&server)
         .await;
 
-    send_provider_auth_request(&server, auth_fixture.auth()).await;
+    let error = send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .expect_err("missing command credentials must fail before transport");
+    assert!(
+        matches!(error.details(), CodexErrorDetails::InvalidRequest(message)
+        if message == "provider auth command did not supply credentials")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    // Correct the fixture explicitly, then exercise a fresh client request.
+    std::fs::remove_file(&failure_marker).unwrap();
+    send_provider_auth_request(&server, auth_fixture.auth())
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1483,7 +1491,7 @@ async fn amazon_bedrock_proxy_uses_command_auth_and_custom_headers() {
         .get_or_insert_default()
         .insert("x-some-header".to_string(), "foo".into());
 
-    send_request_with_provider(provider).await;
+    send_request_with_provider(provider).await.unwrap();
 
     let request = response.single_request();
     assert_eq!(request.path(), "/v1/responses");
@@ -1502,10 +1510,14 @@ async fn amazon_bedrock_proxy_uses_command_auth_and_custom_headers() {
 
 /// Issues one streamed Responses request through a provider configured with command-backed auth.
 ///
-/// The caller owns the server-side assertions, so this helper only validates that the request
-/// reaches `Completed` without surfacing an auth or transport error to the client.
-async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuthInfo) {
+/// The caller owns server-side assertions. Auth and transport errors are returned;
+/// successful execution requires an actual `Completed` event.
+async fn send_provider_auth_request(
+    server: &MockServer,
+    auth: ModelProviderAuthInfo,
+) -> Result<(), CodexErr> {
     let provider = ModelProviderInfo {
+        model_discovery: Default::default(),
         name: "corp".into(),
         base_url: Some(format!("{}/v1", server.uri())),
         env_key: None,
@@ -1526,11 +1538,11 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         supports_standalone_web_search: false,
     };
 
-    send_request_with_provider(provider).await;
+    send_request_with_provider(provider).await
 }
 
 #[expect(clippy::unwrap_used)]
-async fn send_request_with_provider(provider: ModelProviderInfo) {
+async fn send_request_with_provider(provider: ModelProviderInfo) -> Result<(), CodexErr> {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
@@ -1600,14 +1612,14 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
             &responses_metadata,
             &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
-        .await
-        .expect("responses stream to start");
+        .await?;
 
     while let Some(event) = stream.next().await {
-        if let Ok(ResponseEvent::Completed { .. }) = event {
-            break;
+        if let ResponseEvent::Completed { .. } = event? {
+            return Ok(());
         }
     }
+    panic!("response stream ended without a Completed event");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3004,6 +3016,7 @@ async fn azure_responses_request_does_not_store_and_preserves_prefixed_item_ids(
     let resp_mock = mount_sse_once(&server, sse_body.to_string()).await;
 
     let provider = ModelProviderInfo {
+        model_discovery: Default::default(),
         name: "azure".into(),
         base_url: Some(format!("{}/openai", server.uri())),
         env_key: None,
@@ -3629,6 +3642,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         .await;
 
     let provider = ModelProviderInfo {
+        model_discovery: Default::default(),
         name: "custom".to_string(),
         base_url: Some(format!("{}/openai", server.uri())),
         // Reuse the existing environment variable to avoid using unsafe code
@@ -3713,6 +3727,7 @@ async fn env_var_overrides_loaded_auth() {
         .await;
 
     let provider = ModelProviderInfo {
+        model_discovery: Default::default(),
         name: ModelProviderInfo::create_openai_provider(/*base_url*/ None).name,
         base_url: Some(format!("{}/openai", server.uri())),
         // Reuse the existing environment variable to avoid using unsafe code

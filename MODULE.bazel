@@ -2,7 +2,7 @@ module(name = "codex")
 
 bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
-bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "platforms", version = "1.1.0")
 
 # Expose the public protobuf rules already used transitively by rules_rs.
 bazel_dep(name = "protobuf", version = "34.0.bcr.1", repo_name = "com_google_protobuf")
@@ -140,7 +140,7 @@ use_repo(osx, "macos_sdk")
 
 # Needed to disable xcode...
 bazel_dep(name = "apple_support", version = "2.1.0")
-bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "rules_cc", version = "0.2.20")
 single_version_override(
     module_name = "rules_cc",
     patch_strip = 1,

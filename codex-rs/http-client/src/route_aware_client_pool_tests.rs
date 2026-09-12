@@ -19,6 +19,66 @@ use tracing_subscriber::layer::SubscriberExt;
 use super::*;
 use crate::OutboundProxyPolicy;
 
+#[test]
+fn request_failures_classify_tls_errors_inside_io_wrappers() {
+    for nesting in 0..=2 {
+        let causes = [
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            ),
+            io::Error::other(
+                native_tls::Certificate::from_der(b"invalid DER")
+                    .err()
+                    .expect("invalid certificate fixture must fail parsing"),
+            ),
+        ];
+        for mut cause in causes {
+            for _ in 0..nesting {
+                cause = io::Error::other(cause);
+            }
+            let error = RouteAwareRequestError::Route(RouteAwareClientPoolError::Resolve(cause));
+
+            assert_eq!(
+                error.failure_class(),
+                Some(RouteFailureClass::TlsError),
+                "TLS classification must survive {nesting} additional I/O wrappers: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn request_failures_preserve_non_tls_io_classification() {
+    for nesting in 0..=2 {
+        for (mut cause, expected) in [
+            (
+                io::Error::other("tunnel error: proxy authorization required"),
+                RouteFailureClass::ProxyAuthenticationRequired,
+            ),
+            (
+                io::Error::other("certificate text without a typed TLS cause"),
+                RouteFailureClass::ProxyResolutionUnavailable,
+            ),
+            (
+                io::Error::from(io::ErrorKind::ConnectionRefused),
+                RouteFailureClass::ProxyResolutionUnavailable,
+            ),
+        ] {
+            for _ in 0..nesting {
+                cause = io::Error::other(cause);
+            }
+            let error = RouteAwareRequestError::Route(RouteAwareClientPoolError::Resolve(cause));
+
+            assert_eq!(
+                error.failure_class(),
+                Some(expected),
+                "non-TLS classification must survive {nesting} additional I/O wrappers: {error:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn request_failures_classify_real_untrusted_certificate_handshakes() {
     codex_utils_rustls_provider::ensure_rustls_crypto_provider();
