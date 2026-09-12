@@ -406,13 +406,49 @@ async fn repo_ancestry_without_project_marker_does_not_walk_parents() {
     fs::create_dir_all(outer.join(".agents/skills")).expect("create outer skills");
     fs::create_dir_all(cwd.join(".agents/skills")).expect("create cwd skills");
 
-    let roots = repo_agents_skill_roots(Some(Arc::clone(&LOCAL_FS)), &stack(Vec::new()), &cwd)
+    // An ambient repository must not supply the marker this absence case is testing.
+    fs::write(temp_dir.path().join(".git"), "gitdir: fake\n").expect("write unrelated git marker");
+    let marker = ".codex-host-roots-test-marker";
+    for ancestor in cwd.ancestors() {
+        assert_eq!(
+            fs::symlink_metadata(ancestor.join(marker))
+                .expect_err("configured marker must be absent from every ancestor")
+                .kind(),
+            std::io::ErrorKind::NotFound,
+        );
+    }
+    let mut config = toml::map::Map::new();
+    config.insert(
+        "project_root_markers".to_string(),
+        toml::Value::Array(vec![toml::Value::String(marker.to_string())]),
+    );
+    let config_stack = stack(vec![ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: absolute(temp_dir.path().join("config.toml")),
+            profile: None,
+        },
+        toml::Value::Table(config),
+    )]);
+
+    let roots = repo_agents_skill_roots(Some(Arc::clone(&LOCAL_FS)), &config_stack, &cwd)
         .await
         .into_iter()
         .map(|root| root.path)
         .collect::<Vec<_>>();
 
     assert_eq!(roots, vec![cwd.join(".agents/skills")]);
+
+    // The same nonempty configuration must still perform actual marker discovery.
+    fs::write(outer.join(marker), "marker\n").expect("write configured project marker");
+    let roots = repo_agents_skill_roots(Some(Arc::clone(&LOCAL_FS)), &config_stack, &cwd)
+        .await
+        .into_iter()
+        .map(|root| root.path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots,
+        vec![outer.join(".agents/skills"), cwd.join(".agents/skills")],
+    );
 }
 
 #[tokio::test]
