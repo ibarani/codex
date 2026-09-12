@@ -808,13 +808,15 @@ async fn sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata() {
     let tmpdir = tempfile::tempdir().expect("tempdir");
     let repo = tmpdir.path().join("repo");
     let subdir = repo.join("sub");
-    let real_tmp = tmpdir.path().join("real-tmp");
-    let redirected_tmp = tmpdir.path().join("redirected-tmp");
-    let tmp_alias = tmpdir.path().join("tmp-alias");
+    std::fs::create_dir_all(&subdir).expect("create nested workspace");
+    // Keep mutable temp controls in the declared writable workspace, even when
+    // the host's temporary directory is outside /tmp.
+    let real_tmp = subdir.join("real-tmp");
+    let redirected_tmp = subdir.join("redirected-tmp");
+    let tmp_alias = subdir.join("tmp-alias");
     std::fs::create_dir(&real_tmp).expect("create real temp directory");
     std::fs::create_dir(&redirected_tmp).expect("create redirected temp directory");
     std::os::unix::fs::symlink(&real_tmp, &tmp_alias).expect("create temp directory alias");
-    std::fs::create_dir_all(&subdir).expect("create nested workspace");
     assert!(
         std::process::Command::new("git")
             .arg("init")
