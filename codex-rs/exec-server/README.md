@@ -19,6 +19,15 @@ filesystem operations and `codex-linux-sandbox`.
 The server speaks the exec-specific `codex-exec-server-protocol` message
 envelope on the wire.
 
+For a client-spawned stdio server, normal termination keeps the existing
+process-tree termination request and two-second grace period. The supervisor
+also owns a synchronous drop fallback: if its runtime stops or its future is
+cancelled while the child is still unreaped, it requests a process-tree kill
+and a direct-child kill through the retained handle. This fallback is created
+before the supervisor is spawned and uses no cached process identity after a
+completed wait. It is best-effort termination, not asynchronous exit or output
+confirmation; normal graceful shutdown should still be used when possible.
+
 The CLI entrypoint supports:
 
 - `ws://IP:PORT` (default)

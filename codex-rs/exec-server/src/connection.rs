@@ -151,16 +151,37 @@ impl Drop for StdioTransportHandle {
     }
 }
 
-fn spawn_stdio_child_supervisor(mut child_process: Child, mut terminate_rx: watch::Receiver<bool>) {
-    let process_group_id = child_process.id();
+/// Retain child authority until normal completion or cancellation of its supervisor.
+/// Runtime shutdown may drop the supervisor without polling its termination watch.
+struct StdioChild {
+    child: Child,
+}
+
+impl Drop for StdioChild {
+    fn drop(&mut self) {
+        // Tokio returns no ID after wait completes, so a reaped child's former
+        // numeric process group never authorizes this cancellation fallback.
+        if let Some(process_group_id) = self.child.id() {
+            kill_process_tree(&mut self.child, Some(process_group_id));
+            kill_direct_child(&mut self.child, "drop");
+        }
+    }
+}
+
+fn spawn_stdio_child_supervisor(child_process: Child, mut terminate_rx: watch::Receiver<bool>) {
+    // Construct before spawning: even an unpolled future must own its cleanup.
+    let mut owned_child = StdioChild {
+        child: child_process,
+    };
     tokio::spawn(async move {
+        let process_group_id = owned_child.child.id();
         tokio::select! {
-            result = child_process.wait() => {
+            result = owned_child.child.wait() => {
                 log_stdio_child_wait_result(result);
-                kill_process_tree(&mut child_process, process_group_id);
+                kill_process_tree(&mut owned_child.child, process_group_id);
             }
             () = wait_for_stdio_termination(&mut terminate_rx) => {
-                terminate_stdio_child(&mut child_process, process_group_id).await;
+                terminate_stdio_child(&mut owned_child.child, process_group_id).await;
             }
         }
     });
@@ -1040,3 +1061,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "stdio_child_tests.rs"]
+mod stdio_child_tests;
