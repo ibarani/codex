@@ -6,9 +6,9 @@ and final helper linking remain the runtime preparer and consumer's jobs.
 """
 
 import json
-from pathlib import Path
 import re
 import shutil
+from pathlib import Path
 
 from runtime import digest
 
@@ -25,7 +25,58 @@ MODULES = (
 )
 
 
+def _relocate_dependency_metadata(metadata: str) -> str:
+    """Rebase generated dependency variables without changing package fields.
+
+    Args:
+        metadata: The copied libffi, PCRE2 or zlib pkg-config text.
+
+    Returns:
+        Metadata rooted at its exported pkg-config directory.
+
+    Raises:
+        ValueError: The declared prefix or absolute variable layout is ambiguous.
+    """
+    prefixes = re.findall(r"^prefix=(.*)$", metadata, re.MULTILINE)
+    if len(prefixes) != 1:
+        raise ValueError("dependency metadata must declare one prefix")
+    prefix = prefixes[0]
+    if prefix != "${pcfiledir}/../.." and not re.fullmatch(
+        r"(?:/|[A-Za-z]:/)[^$\\\r\n]+", prefix
+    ):
+        raise ValueError("dependency metadata must declare an absolute build prefix")
+    lines = []
+    for line in metadata.splitlines(keepends=True):
+        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*?)(\r?\n)?", line)
+        if assignment:
+            name, value, ending = assignment.groups()
+            if name == "prefix":
+                value = "${pcfiledir}/../.."
+            elif value == prefix or value.startswith(prefix + "/"):
+                value = "${prefix}" + value[len(prefix) :]
+            elif re.match(r"/|[A-Za-z]:[/\\]", value):
+                raise ValueError("dependency metadata variable is outside its prefix")
+            line = f"{name}={value}{ending or ''}"
+        lines.append(line)
+    result = "".join(lines)
+    if prefix != "${pcfiledir}/../.." and prefix in result:
+        raise ValueError("dependency metadata retains a literal build prefix")
+    return result
+
+
 def export_sdk(prefix: Path, receipts: Path, target: str, output: Path):
+    """Export inspected development files and relocatable dependency metadata.
+
+    Args:
+        prefix: The inspected native installation, including development files.
+        receipts: Build and native-library inspection receipts for that prefix.
+        target: The exact supported target triple from those receipts.
+        output: A fresh SDK directory outside both input directories.
+
+    Raises:
+        ValueError: Inputs fail provenance, layout, size or relocation admission.
+        OSError: Reading or exporting files fails; incomplete output is removed.
+    """
     prefix, receipts = prefix.resolve(strict=True), receipts.resolve(strict=True)
     output = output.absolute()
     if (
@@ -100,9 +151,11 @@ def export_sdk(prefix: Path, receipts: Path, target: str, output: Path):
             raise ValueError("SDK inputs exceed the size limit")
         source_name = source.relative_to(prefix).as_posix()
         expected = digest(source)
-        if re.search(r"\.(?:dylib|so(?:\.[0-9]+)*)$", name):
-            if binaries.get(source_name) != expected:
-                raise ValueError("SDK shared library is missing from the receipt")
+        if (
+            re.search(r"\.(?:dylib|so(?:\.[0-9]+)*)$", name)
+            and binaries.get(source_name) != expected
+        ):
+            raise ValueError("SDK shared library is missing from the receipt")
         selected.append((name, source, expected))
     for module in MODULES:
         path = prefix / f"lib/pkgconfig/{module}.pc"
@@ -121,7 +174,22 @@ def export_sdk(prefix: Path, receipts: Path, target: str, output: Path):
             shutil.copy2(source, destination)
             if digest(destination) != expected:
                 raise ValueError("SDK input changed while copying")
-            files.append({"path": name, "sha256": expected})
+            exported = expected
+            if name in {
+                f"lib/pkgconfig/{module}.pc"
+                for module in ("libffi", "libpcre2-8", "zlib")
+            }:
+                # CMake can hard-code exec_prefix independently of prefix; the
+                # consumer's --define-prefix cannot relocate that assignment.
+                metadata = destination.read_text(encoding="utf-8")
+                relocated = _relocate_dependency_metadata(metadata)
+                if relocated != metadata:
+                    destination.write_text(relocated, encoding="utf-8")
+                    exported = digest(destination)
+            record = {"path": name, "sha256": exported}
+            if exported != expected:
+                record["sourceSha256"] = expected
+            files.append(record)
         (output / "sdk.json").write_text(
             json.dumps(
                 {
