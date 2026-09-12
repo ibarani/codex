@@ -135,6 +135,7 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
 }
 
 pub(crate) struct MessageProcessor {
+    plugin_background_owner: PluginBackgroundOwner,
     outgoing: Arc<OutgoingMessageSender>,
     models_refresh_worker: ModelsRefreshWorker,
     turn_cost_worker: Option<TurnCostWorker>,
@@ -524,6 +525,9 @@ impl MessageProcessor {
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
         );
+        let plugin_background_owner = PluginBackgroundOwner {
+            manager: thread_manager.plugins_manager(),
+        };
         if let Some(startup_config) = plugin_startup_tasks {
             // Keep plugin startup warmups aligned at app-server startup.
             let reload_config = match startup_config {
@@ -570,6 +574,7 @@ impl MessageProcessor {
 
         Self {
             outgoing,
+            plugin_background_owner,
             models_refresh_worker,
             turn_cost_worker,
             skills_watcher,
@@ -601,6 +606,9 @@ impl MessageProcessor {
     }
 
     pub(crate) fn clear_runtime_references(&self) {
+        self.plugin_background_owner
+            .manager
+            .shutdown_background_tasks(std::time::Duration::ZERO);
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
         self.models_refresh_worker.shutdown();
@@ -780,6 +788,15 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
+        let plugins_manager = Arc::clone(&self.plugin_background_owner.manager);
+        let drained = tokio::task::spawn_blocking(move || {
+            plugins_manager
+                .shutdown_background_tasks(std::time::Duration::from_secs(/*secs*/ 2))
+        })
+        .await;
+        if !matches!(drained, Ok(true)) {
+            tracing::warn!("plugin background task drain did not complete");
+        }
         self.models_refresh_worker.shutdown();
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
@@ -1716,3 +1733,21 @@ impl MessageProcessor {
 #[cfg(test)]
 #[path = "message_processor_tracing_tests.rs"]
 mod message_processor_tracing_tests;
+
+struct PluginBackgroundOwner {
+    manager: Arc<codex_core_plugins::PluginsManager>,
+}
+
+impl Drop for PluginBackgroundOwner {
+    fn drop(&mut self) {
+        // Constructed before startup admission, so unwinding during construction
+        // and runtime teardown cancel the same blocking workers. Their runtimes can
+        // still observe cancellation after this app-server runtime has stopped.
+        if !self
+            .manager
+            .shutdown_background_tasks(std::time::Duration::from_secs(/*secs*/ 2))
+        {
+            tracing::warn!("plugin background tasks remain after runtime teardown");
+        }
+    }
+}

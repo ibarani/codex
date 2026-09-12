@@ -1,5 +1,6 @@
 mod app_mcp_routing;
 mod artifact_operation;
+mod background_tasks;
 mod command_migration;
 mod discoverable;
 mod error_subtype;

@@ -1,3 +1,5 @@
+use crate::background_tasks::PluginBackgroundTasks;
+use crate::background_tasks::PluginCancellation;
 #[path = "bundled_plugin_exclusions.rs"]
 mod bundled_plugin_exclusions;
 #[path = "remote_mutations.rs"]
@@ -61,7 +63,6 @@ use crate::marketplace_policy::configured_plugins_from_stack;
 use crate::marketplace_upgrade::ConfigLayerReload;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeError;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeOutcome;
-use crate::marketplace_upgrade::upgrade_configured_git_marketplaces_with_mode;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RecommendedPluginsMode;
 use crate::remote::RemoteInstalledPlugin;
@@ -83,7 +84,6 @@ use crate::startup_sync::OPENAI_PLUGINS_GIT_URL;
 use crate::startup_sync::curated_plugins_api_marketplace_path;
 use crate::startup_sync::curated_plugins_repo_path;
 use crate::startup_sync::read_curated_plugins_sha;
-use crate::startup_sync::sync_openai_plugins_repo;
 use crate::store::PluginInstallResult as StorePluginInstallResult;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
@@ -522,6 +522,7 @@ impl From<PluginDetail> for PluginCapabilitySummary {
 }
 
 pub struct PluginsManager {
+    background_tasks: PluginBackgroundTasks,
     codex_home: PathBuf,
     store: PluginStore,
     featured_plugin_ids_cache: RwLock<Option<CachedFeaturedPluginIds>>,
@@ -659,6 +660,7 @@ impl PluginsManager {
         let remote_installed_plugin_bundle_sync_gate =
             crate::remote::remote_installed_plugin_bundle_sync_gate(&codex_home);
         Self {
+            background_tasks: PluginBackgroundTasks::default(),
             codex_home: codex_home.clone(),
             store: PluginStore::new(codex_home),
             featured_plugin_ids_cache: RwLock::new(None),
@@ -691,6 +693,12 @@ impl PluginsManager {
             analytics_events_client: RwLock::new(None),
             plugin_install_source: PluginInstallSource::Manual,
         }
+    }
+
+    /// Cancels and drains the manager's blocking refresh workers. The app-server
+    /// lifecycle calls this before runtime teardown; false means drain was incomplete.
+    pub fn shutdown_background_tasks(&self, timeout: Duration) -> bool {
+        self.background_tasks.shutdown(timeout)
     }
 
     pub fn with_plugin_install_source(mut self, source: PluginInstallSource) -> Self {
@@ -2777,14 +2785,15 @@ impl PluginsManager {
                 let config = config.clone();
                 let on_effective_plugins_changed = on_effective_plugins_changed.clone();
                 let runtime = tokio::runtime::Handle::current();
-                if let Err(err) = std::thread::Builder::new()
-                    .name("plugins-marketplace-auto-upgrade".to_string())
-                    .spawn(move || {
+                if let Err(err) = self.background_tasks.spawn(
+                    "plugins-marketplace-auto-upgrade",
+                    move |cancellation| {
                         let outcome = manager.upgrade_configured_marketplaces_for_config_with_mode(
                             &config,
                             /*marketplace_name*/ None,
                             PluginGitMode::Automatic,
                             &reload_config,
+                            &cancellation,
                         );
                         match outcome {
                             Ok(outcome) => {
@@ -2816,8 +2825,8 @@ impl PluginsManager {
                             Err(err) => err.into_inner(),
                         };
                         state.in_flight = false;
-                    })
-                {
+                    },
+                ) {
                     let mut state = match self.configured_marketplace_upgrade_state.write() {
                         Ok(state) => state,
                         Err(err) => err.into_inner(),
@@ -2887,6 +2896,7 @@ impl PluginsManager {
             marketplace_name,
             PluginGitMode::Manual,
             reload_config,
+            &PluginCancellation::default(),
         )
     }
 
@@ -2897,14 +2907,17 @@ impl PluginsManager {
         marketplace_name: Option<&str>,
         mode: PluginGitMode,
         reload_config: &ConfigLayerReload,
+        cancellation: &PluginCancellation,
     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
-        let mut outcome = upgrade_configured_git_marketplaces_with_mode(
-            self.codex_home.as_path(),
-            &config.config_layer_stack,
-            marketplace_name,
-            mode,
-            reload_config,
-        );
+        let mut outcome =
+            crate::marketplace_upgrade::upgrade_configured_git_marketplaces_cancellable(
+                self.codex_home.as_path(),
+                &config.config_layer_stack,
+                marketplace_name,
+                mode,
+                reload_config,
+                cancellation,
+            );
         if let Some(marketplace_name) = marketplace_name
             && outcome.selected_marketplaces.is_empty()
         {
@@ -2925,6 +2938,7 @@ impl PluginsManager {
                 &outcome.upgraded_roots,
                 &configured_plugin_keys,
                 mode,
+                cancellation,
             ) {
                 Ok(refresh_outcome) => {
                     self.clear_caches_after_marketplace_source_refresh(
@@ -3206,9 +3220,11 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        if let Err(err) = std::thread::Builder::new()
-            .name("plugins-non-curated-cache-refresh".to_string())
-            .spawn(move || manager.run_non_curated_plugin_cache_refresh_loop())
+        if let Err(err) = self
+            .background_tasks
+            .spawn("plugins-non-curated-cache-refresh", move |cancellation| {
+                manager.run_non_curated_plugin_cache_refresh_loop(&cancellation)
+            })
         {
             let mut state = match self.non_curated_cache_refresh_state.write() {
                 Ok(state) => state,
@@ -3247,37 +3263,47 @@ impl PluginsManager {
             });
         let manager = Arc::clone(self);
         let codex_home = self.codex_home.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("plugins-curated-repo-sync".to_string())
-            .spawn(move || {
-                match sync_openai_plugins_repo(codex_home.as_path(), http_client_factory) {
-                    Ok(curated_plugin_version) => {
-                        let configured_curated_plugin_ids =
-                            configured_curated_plugin_ids_from_codex_home(codex_home.as_path());
-                        match refresh_curated_plugin_cache(
-                            codex_home.as_path(),
-                            &curated_plugin_version,
-                            &configured_curated_plugin_ids,
-                        ) {
-                            Ok(cache_refreshed) => {
-                                manager.clear_caches_after_marketplace_source_refresh(
-                                    cache_refreshed,
-                                    on_effective_plugins_changed.as_ref(),
-                                );
-                            }
-                            Err(err) => {
-                                manager.clear_cache();
+        if let Err(err) =
+            self.background_tasks
+                .spawn("plugins-curated-repo-sync", move |cancellation| {
+                    match crate::startup_sync::sync_openai_plugins_repo_cancellable(
+                        codex_home.as_path(),
+                        http_client_factory,
+                        &cancellation,
+                    ) {
+                        Ok(curated_plugin_version) => {
+                            if cancellation.check().is_err() {
                                 CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
-                                warn!("failed to refresh curated plugin cache after sync: {err}");
+                                return;
+                            }
+                            let configured_curated_plugin_ids =
+                                configured_curated_plugin_ids_from_codex_home(codex_home.as_path());
+                            match refresh_curated_plugin_cache(
+                                codex_home.as_path(),
+                                &curated_plugin_version,
+                                &configured_curated_plugin_ids,
+                            ) {
+                                Ok(cache_refreshed) => {
+                                    manager.clear_caches_after_marketplace_source_refresh(
+                                        cache_refreshed,
+                                        on_effective_plugins_changed.as_ref(),
+                                    );
+                                }
+                                Err(err) => {
+                                    manager.clear_cache();
+                                    CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
+                                    warn!(
+                                        "failed to refresh curated plugin cache after sync: {err}"
+                                    );
+                                }
                             }
                         }
+                        Err(err) => {
+                            CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
+                            warn!("failed to sync curated plugins repo: {err}");
+                        }
                     }
-                    Err(err) => {
-                        CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
-                        warn!("failed to sync curated plugins repo: {err}");
-                    }
-                }
-            })
+                })
         {
             CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
             warn!("failed to start curated plugins repo sync task: {err}");
@@ -3412,8 +3438,24 @@ impl PluginsManager {
         }
     }
 
-    fn run_non_curated_plugin_cache_refresh_loop(self: Arc<Self>) {
+    fn run_non_curated_plugin_cache_refresh_loop(
+        self: Arc<Self>,
+        cancellation: &PluginCancellation,
+    ) {
         loop {
+            if cancellation.check().is_err() {
+                let mut state = self
+                    .non_curated_cache_refresh_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.in_flight = false;
+                state.requested = None;
+                self.non_curated_cache_refresh_completion
+                    .send_modify(|completion| {
+                        completion.sequence = completion.sequence.wrapping_add(1)
+                    });
+                return;
+            }
             let request = {
                 let state = match self.non_curated_cache_refresh_state.read() {
                     Ok(state) => state,
@@ -3442,6 +3484,7 @@ impl PluginsManager {
                         &request.roots,
                         &request.configured_plugin_keys,
                         request.git_mode,
+                        cancellation,
                     )
                 }
                 NonCuratedCacheRefreshMode::ForceReinstall => {
@@ -3450,6 +3493,7 @@ impl PluginsManager {
                         &request.roots,
                         &request.configured_plugin_keys,
                         request.git_mode,
+                        cancellation,
                     )
                 }
             };

@@ -1,6 +1,7 @@
 use crate::PluginGitMode;
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
 use crate::app_mcp_routing::apps_route_available;
+use crate::background_tasks::PluginCancellation;
 use crate::is_openai_curated_marketplace_name;
 use crate::manifest::PluginManifest;
 use crate::manifest::PluginManifestFormat;
@@ -504,11 +505,13 @@ pub(crate) fn refresh_non_curated_plugin_cache(
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
 ) -> Result<bool, String> {
+    let cancellation = &PluginCancellation::default();
     collapse_non_curated_cache_refresh(refresh_non_curated_plugin_cache_detailed(
         codex_home,
         additional_roots,
         configured_plugin_keys,
         PluginGitMode::Automatic,
+        cancellation,
     ))
 }
 
@@ -517,6 +520,7 @@ pub(crate) fn refresh_non_curated_plugin_cache_detailed(
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
     git_mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
     refresh_non_curated_plugin_cache_with_mode(
         codex_home,
@@ -524,6 +528,7 @@ pub(crate) fn refresh_non_curated_plugin_cache_detailed(
         configured_plugin_keys,
         NonCuratedCacheRefreshMode::IfVersionChanged,
         git_mode,
+        cancellation,
     )
 }
 
@@ -533,11 +538,13 @@ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall(
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
 ) -> Result<bool, String> {
+    let cancellation = &PluginCancellation::default();
     collapse_non_curated_cache_refresh(refresh_non_curated_plugin_cache_force_reinstall_detailed(
         codex_home,
         additional_roots,
         configured_plugin_keys,
         PluginGitMode::Automatic,
+        cancellation,
     ))
 }
 
@@ -546,6 +553,7 @@ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed(
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
     git_mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
     refresh_non_curated_plugin_cache_with_mode(
         codex_home,
@@ -553,6 +561,7 @@ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed(
         configured_plugin_keys,
         NonCuratedCacheRefreshMode::ForceReinstall,
         git_mode,
+        cancellation,
     )
 }
 
@@ -562,6 +571,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
     configured_plugin_keys: &[String],
     mode: NonCuratedCacheRefreshMode,
     git_mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
     let mut configured_non_curated_plugin_ids = configured_plugin_keys
         .iter()
@@ -651,6 +661,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
     let mut cache_refreshed = false;
     let mut refresh_errors = Vec::new();
     for plugin_id in configured_non_curated_plugin_ids {
+        cancellation.check()?;
         let plugin_key = plugin_id.as_key();
         let Some((source, manifest_fallback_contents)) = plugin_sources.get(&plugin_key).cloned()
         else {
@@ -662,11 +673,15 @@ fn refresh_non_curated_plugin_cache_with_mode(
             continue;
         };
         let refresh_result = (|| -> Result<bool, String> {
-            let materialized =
-                materialize_marketplace_plugin_source_with_mode(codex_home, &source, git_mode)
-                    .map_err(|err| {
-                        format!("failed to materialize plugin source for {plugin_key}: {err}")
-                    })?;
+            let materialized = materialize_marketplace_plugin_source_cancellable(
+                codex_home,
+                &source,
+                git_mode,
+                cancellation,
+            )
+            .map_err(|err| {
+                format!("failed to materialize plugin source for {plugin_key}: {err}")
+            })?;
             let source_path = materialized.path;
             let plugin_version = match manifest_fallback_contents.as_deref() {
                 Some(manifest_contents) => plugin_version_for_source_with_fallback_manifest(
@@ -684,6 +699,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
                 return Ok(false);
             }
 
+            cancellation.check()?;
             match manifest_fallback_contents.as_deref() {
                 Some(manifest_contents) => store.install_with_version_and_fallback_manifest(
                     source_path,
@@ -1744,6 +1760,20 @@ pub(crate) fn materialize_marketplace_plugin_source_with_mode(
     source: &MarketplacePluginSource,
     mode: PluginGitMode,
 ) -> Result<MaterializedMarketplacePluginSource, String> {
+    materialize_marketplace_plugin_source_cancellable(
+        codex_home,
+        source,
+        mode,
+        &PluginCancellation::default(),
+    )
+}
+
+fn materialize_marketplace_plugin_source_cancellable(
+    codex_home: &Path,
+    source: &MarketplacePluginSource,
+    mode: PluginGitMode,
+    cancellation: &PluginCancellation,
+) -> Result<MaterializedMarketplacePluginSource, String> {
     match source {
         MarketplacePluginSource::Local { path } => Ok(MaterializedMarketplacePluginSource {
             path: path.clone(),
@@ -1771,15 +1801,68 @@ pub(crate) fn materialize_marketplace_plugin_source_with_mode(
                         staging_root.display()
                     )
                 })?;
-            clone_git_plugin_source(
-                codex_home,
-                url,
-                ref_name.as_deref(),
-                sha.as_deref(),
-                path.as_deref(),
-                tempdir.path(),
-                mode,
-            )?;
+            let destination = tempdir.path();
+            let clone_cwd = match mode {
+                PluginGitMode::Automatic => Some(codex_home),
+                PluginGitMode::Manual => None,
+            };
+            if let Some(sparse_checkout_path) = path.as_deref() {
+                run_git(
+                    &[
+                        "clone",
+                        "--filter=blob:none",
+                        "--sparse",
+                        "--no-checkout",
+                        url,
+                        destination.to_string_lossy().as_ref(),
+                    ],
+                    clone_cwd,
+                    mode,
+                    cancellation,
+                )?;
+                run_git(
+                    &[
+                        "sparse-checkout",
+                        "set",
+                        "--no-cone",
+                        "--",
+                        sparse_checkout_path,
+                    ],
+                    Some(destination),
+                    mode,
+                    cancellation,
+                )?;
+            } else {
+                run_git(
+                    &["clone", url, destination.to_string_lossy().as_ref()],
+                    clone_cwd,
+                    mode,
+                    cancellation,
+                )?;
+            }
+            if let Some(sha) = sha.as_deref() {
+                run_git(&["checkout", sha], Some(destination), mode, cancellation)?;
+                let checked_out_sha = run_git_output(
+                    &["rev-parse", "HEAD"],
+                    Some(destination),
+                    mode,
+                    cancellation,
+                )?;
+                if !checked_out_sha.eq_ignore_ascii_case(sha) {
+                    return Err(format!(
+                        "checked out Git SHA {checked_out_sha} does not match requested SHA {sha}"
+                    ));
+                }
+            } else if let Some(ref_name) = ref_name.as_deref() {
+                run_git(
+                    &["checkout", ref_name],
+                    Some(destination),
+                    mode,
+                    cancellation,
+                )?;
+            } else if path.is_some() {
+                run_git(&["checkout"], Some(destination), mode, cancellation)?;
+            }
             let path = if let Some(path) = path {
                 AbsolutePathBuf::try_from(tempdir.path().join(path)).map_err(|err| {
                     format!("failed to resolve materialized plugin source path: {err}")
@@ -1813,74 +1896,20 @@ pub(crate) fn materialize_marketplace_plugin_source_with_mode(
     }
 }
 
-fn clone_git_plugin_source(
-    codex_home: &Path,
-    url: &str,
-    ref_name: Option<&str>,
-    sha: Option<&str>,
-    sparse_checkout_path: Option<&str>,
-    destination: &Path,
+fn run_git(
+    args: &[&str],
+    cwd: Option<&Path>,
     mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<(), String> {
-    let clone_cwd = match mode {
-        PluginGitMode::Automatic => Some(codex_home),
-        PluginGitMode::Manual => None,
-    };
-    if let Some(sparse_checkout_path) = sparse_checkout_path {
-        run_git(
-            &[
-                "clone",
-                "--filter=blob:none",
-                "--sparse",
-                "--no-checkout",
-                url,
-                destination.to_string_lossy().as_ref(),
-            ],
-            clone_cwd,
-            mode,
-        )?;
-        run_git(
-            &[
-                "sparse-checkout",
-                "set",
-                "--no-cone",
-                "--",
-                sparse_checkout_path,
-            ],
-            Some(destination),
-            mode,
-        )?;
-    } else {
-        run_git(
-            &["clone", url, destination.to_string_lossy().as_ref()],
-            clone_cwd,
-            mode,
-        )?;
-    }
-    if let Some(sha) = sha {
-        run_git(&["checkout", sha], Some(destination), mode)?;
-        let checked_out_sha = run_git_output(&["rev-parse", "HEAD"], Some(destination), mode)?;
-        if !checked_out_sha.eq_ignore_ascii_case(sha) {
-            return Err(format!(
-                "checked out Git SHA {checked_out_sha} does not match requested SHA {sha}"
-            ));
-        }
-    } else if let Some(ref_name) = ref_name {
-        run_git(&["checkout", ref_name], Some(destination), mode)?;
-    } else if sparse_checkout_path.is_some() {
-        run_git(&["checkout"], Some(destination), mode)?;
-    }
-    Ok(())
-}
-
-fn run_git(args: &[&str], cwd: Option<&Path>, mode: PluginGitMode) -> Result<(), String> {
-    run_git_output(args, cwd, mode).map(drop)
+    run_git_output(args, cwd, mode, cancellation).map(drop)
 }
 
 fn run_git_output(
     args: &[&str],
     cwd: Option<&Path>,
     mode: PluginGitMode,
+    cancellation: &PluginCancellation,
 ) -> Result<String, String> {
     let mut command = mode.command(Path::new("git"));
     command.args(args);
@@ -1899,9 +1928,7 @@ fn run_git_output(
         None
     };
 
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to run git {}: {err}", args.join(" ")))?;
+    let output = cancellation.git(command, "plugin source Git command", /*timeout*/ None)?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }

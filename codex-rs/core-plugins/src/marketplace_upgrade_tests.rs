@@ -262,6 +262,7 @@ ref = "missing-ref"
         &config_reloader(codex_home.path()),
         Some(&normalized_source),
         PluginGitMode::Manual,
+        &crate::background_tasks::PluginCancellation::default(),
     )
     .expect("upgrade should use the validated source")
     .expect("marketplace should be upgraded");
@@ -307,6 +308,7 @@ fn up_to_date_fast_path_validates_marketplace_name() {
         &config_reloader(codex_home.path()),
         Some(&normalized_source),
         PluginGitMode::Manual,
+        &crate::background_tasks::PluginCancellation::default(),
     )
     .expect_err("mismatched marketplace name must not use the up-to-date fast path");
 

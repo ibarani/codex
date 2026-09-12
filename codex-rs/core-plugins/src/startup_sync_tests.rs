@@ -264,8 +264,9 @@ fn pretrust_git_sync_ignores_repository_local_transport_config() {
         ),
     );
 
-    let err = sync_openai_plugins_repo_via_git(&codex_home, &git_wrapper)
-        .expect_err("isolated probe should use the missing global-config remote");
+    let err =
+        sync_openai_plugins_repo_via_git(&codex_home, &git_wrapper, &PluginCancellation::default())
+            .expect_err("isolated probe should use the missing global-config remote");
 
     assert!(err.contains("git ls-remote curated plugins repo"));
     assert!(
@@ -627,6 +628,7 @@ async fn run_http_sync(
             codex_home.as_path(),
             &api_base_url,
             &crate::test_support::test_http_client_factory(),
+            &PluginCancellation::default(),
         )
     })
     .await
@@ -885,8 +887,9 @@ fn sync_openai_plugins_repo_via_git_succeeds_with_local_rewritten_remote() {
         ),
     );
 
-    let synced_sha = sync_openai_plugins_repo_via_git(tmp.path(), &git_wrapper)
-        .expect("git sync should succeed");
+    let synced_sha =
+        sync_openai_plugins_repo_via_git(tmp.path(), &git_wrapper, &PluginCancellation::default())
+            .expect("git sync should succeed");
 
     assert_eq!(synced_sha, sha);
     assert_curated_gmail_repo(&curated_plugins_repo_path(tmp.path()));
@@ -938,8 +941,9 @@ fn sync_openai_plugins_repo_via_git_succeeds_with_local_rewritten_remote() {
         .trim()
         .to_string();
 
-    let synced_sha = sync_openai_plugins_repo_via_git(tmp.path(), &git_wrapper)
-        .expect("incremental git sync should succeed");
+    let synced_sha =
+        sync_openai_plugins_repo_via_git(tmp.path(), &git_wrapper, &PluginCancellation::default())
+            .expect("incremental git sync should succeed");
 
     assert_eq!(synced_sha, updated_sha);
     assert!(
@@ -993,8 +997,9 @@ fn sync_openai_plugins_repo_via_git_succeeds_with_local_rewritten_remote() {
     assert!(!has_plugins_clone_dirs(tmp.path()));
 
     let unchanged_sync_invocation_count = invocation_log_contents.lines().count();
-    let synced_sha = sync_openai_plugins_repo_via_git(tmp.path(), &git_wrapper)
-        .expect("unchanged git sync should succeed");
+    let synced_sha =
+        sync_openai_plugins_repo_via_git(tmp.path(), &git_wrapper, &PluginCancellation::default())
+            .expect("unchanged git sync should succeed");
 
     assert_eq!(synced_sha, updated_sha);
     let invocation_log = std::fs::read_to_string(&invocation_log).expect("read sync invocations");
@@ -1132,7 +1137,8 @@ exit 1
     );
 
     let err =
-        sync_openai_plugins_repo_via_git(tmp.path(), &git_path).expect_err("git sync should fail");
+        sync_openai_plugins_repo_via_git(tmp.path(), &git_path, &PluginCancellation::default())
+            .expect_err("git sync should fail");
 
     assert!(err.contains("fatal: early EOF"));
     assert!(!has_plugins_clone_dirs(tmp.path()));
@@ -1197,8 +1203,9 @@ exit 1
         ),
     );
 
-    let err = sync_openai_plugins_repo_via_git(tmp.path(), &git_path)
-        .expect_err("invalid staged checkout should fail");
+    let err =
+        sync_openai_plugins_repo_via_git(tmp.path(), &git_path, &PluginCancellation::default())
+            .expect_err("invalid staged checkout should fail");
 
     assert!(err.contains("curated plugins archive missing marketplace manifest"));
     assert_curated_gmail_repo(&repo_path);
@@ -1458,4 +1465,52 @@ fn curated_repo_backup_archive_zip_bytes(sha: &str) -> Vec<u8> {
         .expect("write plugin manifest");
 
     writer.finish().expect("finish zip writer").into_inner()
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_local_git_does_not_accept_matching_cached_sha() -> anyhow::Result<()> {
+    use crate::background_tasks::PluginBackgroundTasks;
+    use std::time::Instant;
+
+    let directory = tempdir()?;
+    let home = directory.path().join("home");
+    let repo = curated_plugins_repo_path(&home);
+    std::fs::create_dir_all(repo.join(".git"))?;
+    let sha_path = home.join(CURATED_PLUGINS_SHA_FILE);
+    write_curated_plugins_sha(&sha_path, TEST_CURATED_PLUGIN_SHA).map_err(anyhow::Error::msg)?;
+    let ready = repo.join("local-git-ready");
+    let git = directory.path().join("git-fixture");
+    write_executable_script(
+        &git,
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = -c ] && [ \"$2\" = safe.bareRepository=explicit ] || exit 3\nshift 2\ncase \"$1\" in\nls-remote) printf '%s\\tHEAD\\n' '{TEST_CURATED_PLUGIN_SHA}' ;;\n-C) printf ready > \"$2/local-git-ready\"; sleep 30; exit 1 ;;\n*) exit 2 ;;\nesac\n"
+        ),
+    );
+    let tasks = PluginBackgroundTasks::default();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_home = home.clone();
+    tasks.spawn("cancelled-local-git-fixture", move |cancellation| {
+        let result = sync_openai_plugins_repo_via_git(&worker_home, &git, &cancellation);
+        let _ = result_tx.send(result);
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(/*secs*/ 2);
+    while !ready.is_file() {
+        if Instant::now() >= deadline {
+            tasks.shutdown(Duration::from_secs(/*secs*/ 2));
+            anyhow::bail!("local Git readiness deadline");
+        }
+        std::thread::sleep(Duration::from_millis(/*millis*/ 1));
+    }
+    assert!(tasks.shutdown(Duration::from_secs(/*secs*/ 2)));
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(/*secs*/ 2))?,
+        Err("plugin background task cancelled".to_string())
+    );
+    assert_eq!(
+        read_sha_file(&sha_path).as_deref(),
+        Some(TEST_CURATED_PLUGIN_SHA)
+    );
+    assert!(!has_plugins_clone_dirs(&home));
+    Ok(())
 }
