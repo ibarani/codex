@@ -98,6 +98,11 @@ follows redirects itself, resolves every hop, and removes sensitive headers when
 Do not create a new `HttpClient`, `HttpClientFactory`, or `RouteAwareClientPool` for every request.
 Store the client or pool on the component that owns the traffic so its connections can be reused.
 
+Transport failure classification follows typed causes through nested `io::Error` wrappers.
+A TLS cause remains a TLS failure when wrapped by connection or proxy I/O; certificate-related
+text alone does not establish a TLS cause. Classification does not select a backend or retry a
+request.
+
 ## Sensitive request data
 
 Normal clients emit debug diagnostics containing the request URL and response headers. For
