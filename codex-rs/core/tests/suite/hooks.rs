@@ -362,6 +362,10 @@ import sys
 import time
 
 prompt = json.load(sys.stdin).get("prompt")
+# The gated case consumes one buffered result on the next turn, without
+# launching a second context producer after the release marker is open.
+if {gated} and Path(r"{finished_path}").exists():
+    sys.exit(0)
 Path(r"{started_path}").write_text(prompt, encoding="utf-8")
 while {gated} and not Path(r"{release_path}").exists():
     time.sleep(0.01)

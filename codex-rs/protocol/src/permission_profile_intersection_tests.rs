@@ -95,8 +95,41 @@ fn intersection(
 
 #[test]
 fn effective_workspace_intersection_preserves_network_metadata_and_temp() {
-    let temp = TempDir::new().expect("workspace");
-    let root = canonical(&temp);
+    const WORKSPACE_ENV: &str = "CODEX_PROTOCOL_TEST_INTERSECTION_WORKSPACE";
+    const COMPLETION_FILE: &str = ".permission-fixture-complete";
+    let Some(workspace_path) = std::env::var_os(WORKSPACE_ENV) else {
+        // Both input policies grant TMPDIR writes. Keep that grant disjoint from
+        // the workspace whose narrowing this test observes, even under custom TMPDIR.
+        let layout = TempDir::new().expect("isolated permission fixture");
+        let workspace_path = layout.path().join("workspace");
+        let temporary_path = layout.path().join("temporary");
+        std::fs::create_dir(&workspace_path).expect("workspace directory");
+        std::fs::create_dir(&temporary_path).expect("temporary directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "permission_profile_intersection::tests::effective_workspace_intersection_preserves_network_metadata_and_temp",
+            ])
+            .env(WORKSPACE_ENV, workspace_path.canonicalize().expect("canonical workspace"))
+            .env("TMPDIR", temporary_path.canonicalize().expect("canonical temporary root"))
+            .output()
+            .expect("run isolated permission fixture");
+        assert!(
+            output.status.success(),
+            "isolated permission fixture failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(workspace_path.join(COMPLETION_FILE))
+                .expect("isolated test must execute all assertions"),
+            b"verified\n"
+        );
+        return;
+    };
+    let root = absolute(Path::new(&workspace_path))
+        .canonicalize()
+        .expect("canonical workspace");
     let project = root.join("project");
     std::fs::create_dir(project.as_path()).expect("project directory");
     let gitdir = root.join("external-gitdir");
@@ -123,6 +156,14 @@ fn effective_workspace_intersection_preserves_network_metadata_and_temp() {
     );
     assert_eq!(result.network_sandbox_policy(), Restricted);
     assert!(policy.entries.contains(&special(Tmpdir, Write)));
+    let temporary_path = std::env::var_os("TMPDIR").expect("isolated temporary root");
+    let temporary_root = absolute(Path::new(&temporary_path));
+    for path in [temporary_root.clone(), temporary_root.join("scratch")] {
+        assert_eq!(
+            policy.resolve_access_for_local_path_with_cwd(path.as_path(), root.as_path()),
+            Write
+        );
+    }
     for name in [".git", ".agents", ".codex"] {
         let protected = project.join(name);
         assert!(!policy.can_write_local_path_with_cwd(protected.as_path(), root.as_path()));
@@ -137,6 +178,8 @@ fn effective_workspace_intersection_preserves_network_metadata_and_temp() {
     let strict = intersection(&requested, &strict, &project).file_system_sandbox_policy();
     let git_protection = entry(project.join(".git").as_path(), Read);
     assert!(strict.entries.contains(&git_protection));
+    std::fs::write(root.join(COMPLETION_FILE).as_path(), b"verified\n")
+        .expect("record completed permission assertions");
 }
 
 #[test]

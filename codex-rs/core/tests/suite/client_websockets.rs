@@ -713,6 +713,16 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
         .await
         .expect("websocket prewarm failed");
 
+    #[cfg(unix)]
+    let trace_dir = {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("trace dir")
+    };
+    #[cfg(not(unix))]
     let trace_dir = TempDir::new().expect("trace dir");
     let writer = Arc::new(
         TraceWriter::create(
