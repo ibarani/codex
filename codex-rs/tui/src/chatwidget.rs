@@ -77,7 +77,7 @@ use crate::terminal_title::set_terminal_title;
 use crate::text_formatting::proper_join;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
-use crate::version::CODEX_CLI_VERSION;
+use crate::version::CODEX_CLI_DISPLAY_VERSION;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::AppSummary;
@@ -1470,7 +1470,7 @@ impl ChatWidget {
                 /*reasoning_effort*/ None,
                 /*show_fast_status*/ false,
                 config.cwd.to_path_buf(),
-                CODEX_CLI_VERSION,
+                CODEX_CLI_DISPLAY_VERSION,
             )
             .with_yolo_mode(history_cell::is_yolo_mode(config)),
         )
