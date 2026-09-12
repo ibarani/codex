@@ -32,6 +32,96 @@ struct TestHandler {
     tool_name: codex_tools::ToolName,
 }
 
+fn private_tempdir() -> std::io::Result<TempDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
+    #[cfg(not(unix))]
+    tempfile::Builder::new().tempdir()
+}
+
+#[tokio::test]
+async fn aborted_dispatch_future_records_one_cancelled_terminal() -> anyhow::Result<()> {
+    let temp = private_tempdir()?;
+    let (mut session, turn) = make_session_and_context().await;
+    attach_test_trace(&mut session, &turn, temp.path())?;
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "cancelled-call",
+        "test_tool",
+        ToolCallSource::Direct,
+        "{}",
+    );
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let trace = super::ToolDispatchTrace::start(&invocation);
+        started.send(()).expect("receiver remains alive");
+        std::future::pending::<()>().await;
+        drop(trace);
+    });
+    ready.await?;
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("dispatch was cancelled")
+            .is_cancelled()
+    );
+    let bundle = single_bundle_dir(temp.path())?;
+    let replayed = codex_rollout_trace::replay_bundle(&bundle)?;
+    assert_eq!(
+        replayed.tool_calls["cancelled-call"].execution.status,
+        ExecutionStatus::Cancelled
+    );
+    let events = fs::read_to_string(bundle.join("trace.jsonl"))?
+        .lines()
+        .map(serde_json::from_str::<codex_rollout_trace::RawTraceEvent>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                codex_rollout_trace::RawTraceEventPayload::ToolCallEnded { tool_call_id, .. }
+                    if tool_call_id == "cancelled-call"
+            ))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn panicked_dispatch_records_failure_instead_of_cancellation() -> anyhow::Result<()> {
+    let temp = private_tempdir()?;
+    let (mut session, turn) = make_session_and_context().await;
+    attach_test_trace(&mut session, &turn, temp.path())?;
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "panicked-call",
+        "test_tool",
+        ToolCallSource::Direct,
+        "{}",
+    );
+    let task = tokio::spawn(async move {
+        let _trace = super::ToolDispatchTrace::start(&invocation);
+        panic!("synthetic tool panic");
+    });
+    assert!(task.await.expect_err("dispatch panicked").is_panic());
+    let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
+    assert_eq!(
+        replayed.tool_calls["panicked-call"].execution.status,
+        ExecutionStatus::Failed
+    );
+    Ok(())
+}
+
 impl ToolExecutor<ToolInvocation> for TestHandler {
     fn tool_name(&self) -> codex_tools::ToolName {
         self.tool_name.clone()
@@ -116,7 +206,7 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
 
 #[tokio::test]
 async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let (mut session, turn) = make_session_and_context().await;
     attach_test_trace(&mut session, &turn, temp.path())?;
     session.services.rollout_thread_trace.start_code_cell_trace(
@@ -209,7 +299,7 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
 
 #[tokio::test]
 async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let (mut session, turn) = make_session_and_context().await;
     attach_test_trace(&mut session, &turn, temp.path())?;
 
@@ -242,7 +332,7 @@ async fn dispatch_lifecycle_trace_records_unsupported_tool_failures() -> anyhow:
 
 #[tokio::test]
 async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let (mut session, turn) = make_session_and_context().await;
     attach_test_trace(&mut session, &turn, temp.path())?;
 
@@ -279,7 +369,7 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
 
 #[tokio::test]
 async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
+    let temp = private_tempdir()?;
     let (mut session, turn) = make_session_and_context().await;
     session.services.code_mode_service = CodeModeService::new(
         Arc::new(MissingCellCodeModeSessionProvider),

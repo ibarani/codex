@@ -16,6 +16,67 @@ use super::tool_runtime_trace_event;
 use crate::ExecutionStatus;
 
 #[test]
+fn turn_terminal_trace_preserves_success_and_failure() -> anyhow::Result<()> {
+    for (error, status) in [
+        (None, ExecutionStatus::Completed),
+        (
+            Some(json!({"message": "provider failed"})),
+            ExecutionStatus::Failed,
+        ),
+    ] {
+        let event = EventMsg::TurnComplete(serde_json::from_value(json!({
+            "turn_id": "actual-turn",
+            "last_agent_message": null,
+            "error": error,
+        }))?);
+        let mapped = super::codex_turn_trace_event("thread".into(), "fallback", &event)
+            .expect("terminal turn event");
+        assert_eq!(mapped.context_turn_id, "actual-turn");
+        assert_eq!(
+            mapped.payload,
+            crate::RawTraceEventPayload::CodexTurnEnded {
+                codex_turn_id: "actual-turn".into(),
+                status,
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn intermediate_error_does_not_close_a_turn() -> anyhow::Result<()> {
+    let event = EventMsg::Error(serde_json::from_value(json!({
+        "message": "retryable provider error",
+    }))?);
+    assert!(super::codex_turn_trace_event("thread".into(), "turn", &event).is_none());
+    Ok(())
+}
+
+#[test]
+fn every_abort_reason_preserves_cancelled_status_and_turn_identity() -> anyhow::Result<()> {
+    for reason in ["interrupted", "replaced", "review_ended", "budget_limited"] {
+        for turn_id in [None, Some("actual-turn")] {
+            let event = EventMsg::TurnAborted(serde_json::from_value(json!({
+                "turn_id": turn_id,
+                "reason": reason,
+            }))?);
+            let mapped = super::codex_turn_trace_event("thread".into(), "fallback", &event)
+                .expect("aborted turn event");
+            let expected_id = turn_id.unwrap_or("fallback");
+            assert_eq!(mapped.context_turn_id, expected_id);
+            assert_eq!(
+                mapped.payload,
+                crate::RawTraceEventPayload::CodexTurnEnded {
+                    codex_turn_id: expected_id.into(),
+                    status: ExecutionStatus::Cancelled,
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()> {
     let agent_thread_id = ThreadId::new();
     let event = EventMsg::SubAgentActivity(SubAgentActivityEvent {

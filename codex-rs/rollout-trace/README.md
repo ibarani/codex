@@ -13,6 +13,20 @@ inspect.
 
 The key design choice is: **observe first, interpret later**.
 
+Turn completion preserves the protocol's terminal error: an unsuccessful turn
+is `failed`, while an orderly session shutdown can still be `completed`.
+Intermediate recoverable errors do not end the turn. Every admitted tool
+dispatch records one terminal outcome, including cancellation when its future
+is dropped and failure when it unwinds from a panic. These dispatch outcomes
+do not invent a process exit code or prove that an underlying child stopped;
+terminal runtime events and process cleanup are separate evidence.
+
+When provider-command authentication is selected, failed acquisition produces
+no inference attempt or provider request. Existing explicit static/environment
+token precedence is unchanged.
+Credential-helper diagnostics retain the failure stage and process status
+without forwarding command paths, stdout or stderr.
+
 Hot-path Codex code does not try to build the final graph while the session is
 running. It writes ordered raw events and payload references. The offline reducer
 then decides which events became model-visible conversation, which events were

@@ -59,7 +59,11 @@ pub(crate) fn codex_turn_trace_event(
                 context_turn_id: codex_turn_id.clone(),
                 payload: RawTraceEventPayload::CodexTurnEnded {
                     codex_turn_id,
-                    status: ExecutionStatus::Completed,
+                    status: if event.error.is_some() {
+                        ExecutionStatus::Failed
+                    } else {
+                        ExecutionStatus::Completed
+                    },
                 },
             })
         }

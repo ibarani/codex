@@ -206,6 +206,14 @@ pub(crate) fn resolve_provider_auth(
         return Ok(unauthenticated_auth_provider());
     }
 
+    // Command auth is an explicit credential requirement. Acquisition failure
+    // must not turn the same request into an unauthenticated provider call.
+    if provider.auth.is_some() && auth.is_none() {
+        return Err(CodexErr::InvalidRequest(
+            "provider auth command did not supply credentials".to_string(),
+        ));
+    }
+
     if matches!(
         auth,
         Some(CodexAuth::BedrockApiKey(_) | CodexAuth::BedrockAccessKeys(_))
@@ -549,6 +557,16 @@ mod tests {
                 .expect("current directory should be absolute"),
         });
         let command_auth = CodexAuth::from_api_key("command-token");
+
+        // This is the same admission boundary for every failed command outcome:
+        // missing, empty, invalid UTF-8, timed out or unsuccessful execution.
+        let error = resolve_provider_auth(/*auth*/ None, &provider)
+            .err()
+            .expect("configured command auth must not silently become anonymous");
+        assert_eq!(
+            error.to_string(),
+            "provider auth command did not supply credentials"
+        );
 
         let headers = resolve_provider_auth(Some(&command_auth), &provider)
             .expect("auth should resolve")
