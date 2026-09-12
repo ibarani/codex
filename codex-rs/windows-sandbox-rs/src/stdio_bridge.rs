@@ -48,7 +48,14 @@ pub async fn forward_sandbox_session_stdio(spawned: SpawnedProcess) -> i32 {
         res = &mut exit_rx => res.unwrap_or(-1),
         res = tokio::signal::ctrl_c() => {
             if let Ok(()) = res {
-                session.request_terminate();
+                if let Err(error) = session.request_terminate() {
+                    // Keep observing actual exit; a failed request cannot manufacture one.
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "windows sandbox termination request failed ({:?})",
+                        error.kind(),
+                    );
+                }
             }
             exit_rx.await.unwrap_or(-1)
         }

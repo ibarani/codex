@@ -247,7 +247,13 @@ impl UnifiedExecProcess {
         let confirmation = async {
             if !self.has_observed_exit_and_closed_output() {
                 match &self.process_handle {
-                    ProcessHandle::Local(process_handle) => process_handle.request_terminate(),
+                    ProcessHandle::Local(process_handle) => {
+                        process_handle.request_terminate().map_err(|_| {
+                            UnifiedExecError::process_failed(
+                                "process termination request failed".to_string(),
+                            )
+                        })?;
+                    }
                     ProcessHandle::ExecServer(process_handle) => {
                         process_handle.terminate().await.map_err(|_| {
                             UnifiedExecError::process_failed(

@@ -14,8 +14,26 @@ Lightweight helpers for spawning interactive processes either under a PTY (pseud
   - `writer_sender()` → `mpsc::Sender<Vec<u8>>` (stdin)
   - `resize(TerminalSize)`
   - `close_stdin()`
+  - `request_terminate()` → `io::Result<()>`, leaving output readers active.
+  - `signal(ProcessSignal)` → `io::Result<()>`.
   - `has_exited()`, `exit_code()`, `terminate()`
 - `SpawnedProcess` bundles `session`, `stdout_rx`, `stderr_rx`, and `exit_rx` (oneshot exit code).
+
+Termination requests and observed exit are separate: `Ok(())` acknowledges the
+request, while `exit_rx` and output-channel closure establish actual completion.
+A failed request preserves its error kind and the terminator for an explicit
+retry. Backend error text is not propagated. Successful termination consumes
+the terminator, so repeated requests and later destruction do not send it again.
+Unix interrupts retain the terminator; successful Windows interrupts consume it
+because those supported non-PTY backends terminate on interrupt. A poisoned
+terminator lock returns an error without invoking the backend.
+
+`terminate()` and destruction remain best-effort cleanup: they request
+termination and abort I/O helpers, reporting failures to stderr using a fixed
+message and the error kind. Diagnostic write failure does not interrupt cleanup.
+They do not promise successful termination, preserve output, or retry indefinitely.
+Callers requiring a recoverable error or complete output use `request_terminate()`
+and observe exit/output separately.
 
 ## Usage examples
 

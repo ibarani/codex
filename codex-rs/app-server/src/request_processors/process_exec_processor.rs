@@ -548,10 +548,12 @@ async fn run_process(params: RunProcessParams) {
                             ProcessControl::Resize { size } => {
                                 handle_process_resize(&session, size)
                             }
-                            ProcessControl::Kill => {
-                                session.request_terminate();
-                                Ok(())
-                            }
+                            ProcessControl::Kill => session.request_terminate().map_err(|error| {
+                                internal_error(format!(
+                                    "process termination request failed ({:?})",
+                                    error.kind(),
+                                ))
+                            }),
                         };
                         if let Some(response_tx) = response_tx
                             && response_tx.send(result).is_err()
@@ -564,13 +566,23 @@ async fn run_process(params: RunProcessParams) {
                     },
                     None => {
                         control_open = false;
-                        session.request_terminate();
+                        if let Err(error) = session.request_terminate() {
+                            tracing::warn!(
+                                error_kind = ?error.kind(),
+                                "process termination request failed after control channel closed"
+                            );
+                        }
                     }
                 }
             }
             outcome = &mut expiration, if expiration_outcome.is_none() => {
                 expiration_outcome = Some(outcome);
-                session.request_terminate();
+                if let Err(error) = session.request_terminate() {
+                    tracing::warn!(
+                        error_kind = ?error.kind(),
+                        "process termination request failed after execution expired"
+                    );
+                }
             }
             exit = &mut exit_rx => {
                 if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {

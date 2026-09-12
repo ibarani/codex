@@ -941,7 +941,10 @@ async fn assert_legacy_tty_descendant_lifecycle(
     let descendant_process = open_process_for_wait(descendant_pid);
 
     if matches!(lifecycle, LegacyTtyDescendantLifecycle::Terminate) {
-        spawned.session.request_terminate();
+        assert!(
+            spawned.session.request_terminate().is_ok(),
+            "request sandbox ConPTY termination"
+        );
     }
     let (_, exit_code) =
         collect_stdout_and_exit(spawned, codex_home.path(), Duration::from_secs(15)).await;
